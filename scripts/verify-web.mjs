@@ -5,11 +5,15 @@ import { chromium } from 'playwright';
 import { startServer } from './serve.mjs';
 import { run, TUNING } from '../src/engine.mjs';
 import { PALETTE } from '../src/palette.mjs';
+import { decodePng, comparePixels, distinctColors } from './png.mjs';
 
 const FPS_FLOOR = 13;
 const FPS_BASELINE = 40;
 const BOT_FRAMES = 420;
 const DEATH_ATTEMPTS = 60;
+/* canvas 带 border-radius，元素截图的四个角会被裁掉，所以逐像素对账只比内部矩形。
+   这个数不是拍的：下面有一条断言把它和真实的计算后半径钉在一起，改 CSS 就会红。 */
+const PNG_INSET = 12;
 const fail = [];
 const pass = [];
 const metrics = {};
@@ -28,11 +32,7 @@ function sha(buf) { return crypto.createHash('sha256').update(buf).digest('hex')
    上一版是算面积账，连错两轮，根因同一个：面积账要手工重现绘制顺序和遮挡关系，
    而那是一笔算不清的账。画一遍再数，遮挡由构造正确。
 
-   它不验什么：不验配色好看、不验布局合理。它验三件事，画出来了、几何没歪、
-   画面已经追上了状态。好不好玩机器判不了，也不该假装能判。
-
-   取整语义必须和 src/render.mjs 的 rectPx 逐字一致。快闸门里有一条断言钉住那一行，
-   改它必须改这里。 */
+   取整语义必须和 src/render.mjs 的 rectPx 逐字一致。 */
 function referenceRaster(snap, phase) {
   const cell = snap.cell;
   const w = snap.cols * cell;
@@ -92,6 +92,22 @@ async function countColor(page, hex) {
   }, hex);
 }
 
+/* 把 canvas 的真像素搞出来。走 base64 而不是数组：100 多万个数字序列化成 JSON 会很难看。 */
+async function readCanvasPixels(page) {
+  const b64 = await page.evaluate(() => {
+    const canvas = document.getElementById('stage');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let s = '';
+    const step = 0x8000;
+    for (let i = 0; i < d.length; i += step) {
+      s += String.fromCharCode.apply(null, d.subarray(i, Math.min(i + step, d.length)));
+    }
+    return btoa(s);
+  });
+  return Buffer.from(b64, 'base64');
+}
+
 async function main() {
   const server = await startServer(process.cwd(), 0);
   const browser = await chromium.launch({ headless: true, args: ['--use-angle=swiftshader', '--use-gl=angle', '--enable-unsafe-swiftshader'] });
@@ -116,14 +132,9 @@ async function main() {
     expectEq(metrics.menuPixels, menuRef.counts.menu, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
     expect(menuRef.counts.menu === geo.w * geo.h, 'menu-reference-selftest', '参考光栅器自己就算错了菜单遮罩');
 
-    /* 三个动作必须在**同一次** evaluate 里，而且冻结要在 reset 之前。
-
-       两个坑都在 CI 上真红过，而且是相反方向的：
-       1. 不冻结：rAF 循环在我读完摘要之后继续推帧，于是像素和摘要不是同一帧。
-          证据：两轮摘要逐字相同，而车像素 32736 vs 32960。
-       2. 冻结但分两次往返：reset 和 setPaused 之间那一帧 rAF 推了一下，停在 421。
-
-       所以窗口要由**构造**消除，不是靠把两次调用写得近一点。 */
+    /* 三个动作必须在同一次 evaluate 里，而且冻结要在 reset 之前。两个坑都在 CI 上
+       真红过，而且方向相反：不冻结时 rAF 在我读完摘要后继续推帧（两轮摘要逐字
+       相同而车像素 32736 vs 32960）；分两次往返时中间那一帧溢进来，停在 421。 */
     const startFrame = await page.evaluate(frames => {
       window.__diag.setPaused(true);
       window.__diag.reset(1);
@@ -150,11 +161,6 @@ async function main() {
     metrics.deadPixels = await countColor(page, PALETTE.dead);
     metrics.expectedDeadPixels = ref.counts.dead;
     metrics.menuPixelsInPlay = await countColor(page, PALETTE.menu);
-    const carAgain = await countColor(page, PALETTE.car);
-    const frameAfter = await page.evaluate(() => window.__diag.snapshot().frame);
-    metrics.frameAfterMeasure = frameAfter;
-    expectEq(frameAfter, live.frame, 'frame-stable-during-measurement', '量像素期间世界又跑了，摘要和画面不是同一帧');
-    expectEq(carAgain, metrics.carPixels, 'redraw-idempotent', '同一状态重读两次像素数就变了，渲染本身在抖');
     expectEq(metrics.playerPixels, ref.counts.player, 'player-pixels', '玩家像素数不对');
     expectEq(metrics.carPixels, ref.counts.car, 'car-pixels', '车像素数不对');
     expectEq(metrics.logPixels, ref.counts.log, 'log-pixels', '木头像素数不对');
@@ -162,6 +168,55 @@ async function main() {
     expectEq(metrics.deadPixels, 0, 'dead-strip-absent-while-alive', '活着时不该有死亡横带');
     expectEq(metrics.menuPixelsInPlay, 0, 'menu-overlay-absent-while-playing', '开局后菜单遮罩应该消失');
     expect(ref.counts.car > 0 && ref.counts.log > 0 && ref.counts.tree > 0, 'reference-raster-non-empty', '参考光栅器一个实体都没画，那后面每条等号都是免费通过');
+
+    /* ---------- PNG 里画的和 canvas 里画的是同一帧吗 ----------
+
+       之前三张截图只有「互不相同 + 字节非空」两条弱断言，真正的内容断言全在
+       canvas 像素上,PNG 编码那一层没人看着。那不是空断言，是覆盖缺口，
+       而两者在报告上长得一模一样：全绿。
+
+       世界现在是冻住的，所以截图和 getImageData 拿到的必须是同一帧,下面那条
+       frame-stable 断言跨过这整段，就是为了守这个前提。 */
+    const radius = await page.evaluate(() => parseFloat(getComputedStyle(document.getElementById('stage')).borderTopLeftRadius) || 0);
+    metrics.canvasRadius = radius;
+    metrics.pngInset = PNG_INSET;
+    expect(PNG_INSET >= radius + 2, 'png-inset-covers-radius', '内边距盖不住 border-radius 的裁切，四个角会制造假红');
+
+    const stageShot = await page.locator('#stage').screenshot();
+    const decoded = decodePng(stageShot);
+    const canvasPixels = await readCanvasPixels(page);
+    metrics.pngBytes = stageShot.length;
+    metrics.pngSize = decoded.width + 'x' + decoded.height;
+    metrics.pngFiltersSeen = decoded.filtersSeen;
+    expectEq(decoded.width, geo.w, 'png-width-matches-canvas', 'PNG 宽度和 canvas 不一样，后面逐像素比不了');
+    expectEq(decoded.height, geo.h, 'png-height-matches-canvas', 'PNG 高度和 canvas 不一样，后面逐像素比不了');
+    expectEq(canvasPixels.length, geo.w * geo.h * 4, 'canvas-readback-length', 'canvas 读回来的字节数不对');
+
+    const pngColors = distinctColors(decoded.data, geo.w, geo.h, PNG_INSET);
+    metrics.pngDistinctColors = pngColors;
+    expect(pngColors > 3, 'png-not-flat', 'PNG 内部几乎是纯色，那下面那条逐像素等号会免费通过');
+
+    const cmp = comparePixels(decoded.data, canvasPixels, geo.w, geo.h, PNG_INSET);
+    metrics.pngDiff = cmp.diff;
+    metrics.pngCompared = cmp.compared;
+    metrics.pngFirstDiff = cmp.first;
+    expectEq(cmp.diff, 0, 'png-vs-canvas', 'PNG 里画的和 canvas 里画的不是同一帧');
+    expectEq(cmp.compared, (geo.w - 2 * PNG_INSET) * (geo.h - 2 * PNG_INSET), 'png-compared-whole-interior', '比较器没把整个内部矩形都比到');
+
+    /* 变异体：翻一个像素，上面那条等号必须拓得出来。不配它的话，
+       一个永远返回 0 的比较器会让 png-vs-canvas 变成纯装饰。 */
+    const flipped = Buffer.from(decoded.data);
+    const probe = ((PNG_INSET + 5) * geo.w + (PNG_INSET + 7)) * 4;
+    flipped[probe] ^= 0xff;
+    const pngMutant = comparePixels(flipped, canvasPixels, geo.w, geo.h, PNG_INSET);
+    metrics.pngMutantDiff = pngMutant.diff;
+    expectEq(pngMutant.diff, 1, 'png-comparator-not-decorative', '翻了一个像素居然没被拓出来，说明上面那条等号是装饰');
+
+    const carAgain = await countColor(page, PALETTE.car);
+    const frameAfter = await page.evaluate(() => window.__diag.snapshot().frame);
+    metrics.frameAfterMeasure = frameAfter;
+    expectEq(frameAfter, live.frame, 'frame-stable-during-measurement', '量像素期间世界又跑了，摘要和画面不是同一帧');
+    expectEq(carAgain, metrics.carPixels, 'redraw-idempotent', '同一状态重读两次像素数就变了，渲染本身在抖');
 
     metrics.bestRunScore = live.score;
     await page.reload({ waitUntil: 'networkidle' });
@@ -226,6 +281,7 @@ async function main() {
     fs.writeFileSync('artifacts/menu.png', menu);
     fs.writeFileSync('artifacts/play.png', playShot);
     fs.writeFileSync('artifacts/dead.png', deadShot);
+    fs.writeFileSync('artifacts/stage-frozen.png', stageShot);
   } finally {
     await page.close().catch(() => null);
     await browser.close().catch(() => null);
