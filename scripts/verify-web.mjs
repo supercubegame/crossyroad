@@ -116,19 +116,26 @@ async function main() {
     expectEq(metrics.menuPixels, menuRef.counts.menu, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
     expect(menuRef.counts.menu === geo.w * geo.h, 'menu-reference-selftest', '参考光栅器自己就算错了菜单遮罩');
 
-    /* 冻住循环再量像素。不冻的后果已经在 CI 上看到两轮：rAF 循环在我读完
-       摘要之后继续推帧，于是摘要和像素根本不是同一帧。证据很硬：两轮的摘要
-       逐字相同，而车像素一个 32736 一个 32960。
-       注意先冻后面那条帧率断言就会盯着一个静止的世界等到超时，所以测帧率之前
-       要显式解冻，并且那条断言自己先确认循环在跑。 */
-    await page.evaluate(() => window.__diag.reset(1));
-    await page.evaluate(() => window.__diag.setPaused(true));
-    await page.evaluate(frames => window.__diag.advance(frames, true), BOT_FRAMES);
+    /* 三个动作必须在**同一次** evaluate 里，而且冻结要在 reset 之前。
+
+       两个坑都在 CI 上真红过，而且是相反方向的：
+       1. 不冻结：rAF 循环在我读完摘要之后继续推帧，于是像素和摘要不是同一帧。
+          证据：两轮摘要逐字相同，而车像素 32736 vs 32960。
+       2. 冻结但分两次往返：reset 和 setPaused 之间那一帧 rAF 推了一下，停在 421。
+
+       所以窗口要由**构造**消除，不是靠把两次调用写得近一点。 */
+    const startFrame = await page.evaluate(frames => {
+      window.__diag.setPaused(true);
+      window.__diag.reset(1);
+      return window.__diag.advance(frames, true);
+    }, BOT_FRAMES);
     const live = await page.evaluate(() => ({ digest: window.__diag.digest(), score: window.__diag.score(), snap: window.__diag.snapshot(), phase: window.__diag.phase(), frame: window.__diag.snapshot().frame }));
     const nodeRun = run(1, BOT_FRAMES);
     metrics.browserDigest = live.digest;
     metrics.nodeDigest = nodeRun.digest;
     metrics.frameAtMeasure = live.frame;
+    metrics.frameBudget = BOT_FRAMES;
+    expectEq(startFrame, BOT_FRAMES, 'frame-equals-budget', '推完固定预算后帧号不等于预算，说明有一帧 rAF 溢进来了');
     expectEq(live.digest, nodeRun.digest, 'browser-vs-node-digest', '浏览器和 Node 同帧数摘要不同，说明壳和核心漂了');
 
     const ref = referenceRaster(live.snap, live.phase);
@@ -164,8 +171,10 @@ async function main() {
     metrics.storageDegraded = !!afterReload.degraded;
     expectEq(afterReload.best, live.score, 'best-persists', '最高分没有写回存储');
 
-    await page.evaluate(() => window.__diag.reset(1));
-    await page.evaluate(() => window.__diag.setPaused(true));
+    await page.evaluate(() => {
+      window.__diag.setPaused(true);
+      window.__diag.reset(1);
+    });
     let deathState = null;
     for (let i = 0; i < DEATH_ATTEMPTS; i += 1) {
       deathState = await page.evaluate(hop => window.__diag.stepWith('up', hop + 2), TUNING.hopFrames);
@@ -195,10 +204,12 @@ async function main() {
     expect(shots.every(s => s.bytes > 0), 'shots-non-empty', '截图有空壳');
     expect(new Set(shots.map(s => s.sha)).size === shots.length, 'shots-distinct', '几张图居然一模一样，像是截图采在同一帧冻结状态');
 
-    /* 前面把循环冻住了，这里必须显式解冻，并且先自证它真的在跑,
+    /* 前面把循环冻住了，这里必须显式解冻，并且先自证它真的在跑，
        否则下面那条帧率断言会盯着一个静止的计数器，而报告里只会写「帧率太低」。 */
-    await page.evaluate(() => window.__diag.reset(1));
-    await page.evaluate(() => window.__diag.setPaused(false));
+    await page.evaluate(() => {
+      window.__diag.setPaused(false);
+      window.__diag.reset(1);
+    });
     const running = await page.evaluate(() => window.__diag.running());
     expect(running, 'loop-resumed-before-fps', '循环没有解冻，帧率断言会报一个假的低帧率');
     const f0 = await page.evaluate(() => window.__diag.frames());
