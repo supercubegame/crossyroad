@@ -1,4 +1,4 @@
-/* 壳：输入、循环、存档、DOM 上的字。游戏规则一条都不在这里,全在纯核心里。
+/* 壳：输入、循环、存档、DOM 上的字。游戏规则一条都不在这里，全在纯核心里。
 
    两条壳层的铁律，各有一条扫描器守着：
    - canvas 不做 devicePixelRatio 缩放（像素等号断言依赖 1:1）
@@ -178,7 +178,11 @@ canvas.addEventListener('touchend', function (ev) {
   else onDir(dy > 0 ? 'down' : 'up');
 }, { passive: true });
 
-/* 闸门用的只读出口。字段可以加，不能删改。 */
+/* 闸门用的只读出口。字段可以加，不能删改。
+
+   stepWith 是后加的，而它补的是一个真洞：press() 只能设 pending，而 pending 只有
+   rAF 里的 tick() 会消费。闸门里用 advance() 推帧，它压根不读 pending，于是那一轮
+   「按了十八次方向键」完全没注入任何输入，而死亡断言因此变空。 */
 window.__diag = {
   version: 1,
   phase: function () { return phase; },
@@ -199,6 +203,16 @@ window.__diag = {
     if (state.status === 'dead' && phase === 'play') onDeath();
     draw();
     return snapshot(state).frame;
+  },
+  stepWith: function (dir, n) {
+    for (let i = 0; i < n; i += 1) {
+      if (state.status !== 'play') break;
+      step(state, i === 0 ? dir : null);
+      maybeStoreBest();
+    }
+    if (state.status === 'dead' && phase === 'play') onDeath();
+    draw();
+    return { phase: phase, status: state.status, score: state.score, reason: state.deathReason };
   },
   settle: function () {
     let guard = 0;
