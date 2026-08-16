@@ -63,6 +63,7 @@ function engSection(data) {
     '- 机器人固定帧摘要: `' + m.digestAtBudget + '`',
     '- 压测: ' + m.perfMs + ' ms / ' + m.perfFrames + ' steps（预算 ' + m.perfBudgetMs + ' ms，实测基线 ' + m.perfMeasuredMs + '）',
     '- PNG 解码器自证: ' + png.width + 'x' + png.height + '，过滤器分支 ' + JSON.stringify(png.filtersSeen) + '，夹具 ' + png.bytes + 'B',
+    '- Pages 守卫: 锥子 ' + JSON.stringify(m.pagesAnchors) + '，正向样本 index.html ' + m.pagesPositiveBytes + 'B，负向样本 ' + m.pagesNegativeSamples + ' 个全部判红',
     '- 规矩文件: ' + m.rulesLines + ' 行',
     '- 义务: ' + m.obligationsOpen + ' 条，最早到期还剩 ' + m.nextDueInDays + ' 天',
     '- 变异体: ' + m.mutantsKilled + '/' + m.mutantsTotal,
