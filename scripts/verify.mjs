@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import { createState, step, run, makeRow, rowType, entitiesAt, TUNING, safeToLand } from '../src/engine.mjs';
 import { PALETTE, PROBE_COLORS } from '../src/palette.mjs';
+import { crc32, decodePng, encodePng, comparePixels, distinctColors } from './png.mjs';
 
 const PERF_FRAMES = 20000;
 const PERF_BUDGET_MS = 60;
@@ -11,6 +12,8 @@ const MAX_HEARTBEAT_AGE_DAYS = 3;
 const OBLIGATION_GRACE_DAYS = 30;
 const BOT_FRAMES = 420;
 const MUTANT_EXPECTATIONS = 3;
+const PNG_FILTERS = [0, 1, 2, 3, 4];
+const CRC32_IEND = 0xae426082;
 const fail = [];
 const pass = [];
 const metrics = {};
@@ -29,6 +32,9 @@ function expectMatch(value, re, name, detail) {
 function median(arr) {
   const s = arr.slice().sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
+}
+function throwsWith(fn) {
+  try { fn(); return null; } catch (err) { return String(err && err.message || err); }
 }
 
 function stripComments(js) {
@@ -77,6 +83,7 @@ function writeReport() {
 const engineSrc = read('src/engine.mjs');
 const mainSrc = read('src/main.mjs');
 const renderSrc = read('src/render.mjs');
+const verifyWebSrc = read('scripts/verify-web.mjs');
 const workflowSrc = read('.github/workflows/verify.yml');
 const pagesWorkflow = read('.github/workflows/pages.yml');
 const hb = json('heartbeat.json');
@@ -144,6 +151,65 @@ for (let r = 3; r < 60 && foundRiverRow === null; r += 1) {
 expect(foundRiverRow !== null, 'find-safe-river-landing', '夹具没找到一个原版 safeToLand 为真的河面落点');
 if (foundRiverRow !== null) expect(typeof safeToLand(createState(7), foundRiverRow, foundSafeCol) === 'boolean', 'safe-to-land-returns-bool', '轮询条件必须返回布尔，不许返回计数');
 
+/* ---------- PNG 解码器：它自己先得被验一遍 ---------- */
+
+expectEq(crc32(Buffer.from('IEND', 'ascii')), CRC32_IEND, 'crc32-known-constant', 'crc32 连公认常量都对不上，后面每条 CRC 负向断言都不算数');
+
+const PW = 7;
+const PH = 5;
+const pngFixture = Buffer.alloc(PW * PH * 4);
+for (let y = 0; y < PH; y += 1) {
+  for (let x = 0; x < PW; x += 1) {
+    const i = (y * PW + x) * 4;
+    pngFixture[i] = (x * 37 + y * 11) & 0xff;
+    pngFixture[i + 1] = (x * 5 + y * 61) & 0xff;
+    pngFixture[i + 2] = (x * x + y * y * 3) & 0xff;
+    pngFixture[i + 3] = 255;
+  }
+}
+/* 夹具自证：纯色图会让五种过滤器分支互相掩盖（预测器全部算出同一个值）。 */
+expect(distinctColors(pngFixture, PW, PH, 0) > 10, 'png-fixture-not-flat', 'PNG 夹具颜色太少，过滤器分支验不出东西');
+
+const pngBytes = encodePng(PW, PH, pngFixture, PNG_FILTERS);
+const pngDecoded = decodePng(pngBytes);
+metrics.pngSelfTest = { width: pngDecoded.width, height: pngDecoded.height, filtersSeen: pngDecoded.filtersSeen, bytes: pngBytes.length };
+expectEq(pngDecoded.width, PW, 'png-width-roundtrip', 'IHDR 宽度没转对');
+expectEq(pngDecoded.height, PH, 'png-height-roundtrip', 'IHDR 高度没转对');
+expectEq(pngDecoded.filtersSeen.join(','), PNG_FILTERS.join(','), 'png-all-filter-branches-exercised', '五种过滤器分支没全跑到，没跑到的那几条和空断言是一个形状');
+const pngRoundTrip = comparePixels(pngDecoded.data, pngFixture, PW, PH, 0);
+expectEq(pngRoundTrip.diff, 0, 'png-roundtrip-exact', '编码再解码之后像素变了');
+expectEq(pngRoundTrip.compared, PW * PH, 'png-roundtrip-covered-all', '比较器没把整张图都比到');
+
+expect(!!throwsWith(() => decodePng(Buffer.concat([Buffer.alloc(8), pngBytes.subarray(8)]))), 'png-rejects-bad-signature', '签名坏了居然能解码');
+const pngCorrupt = Buffer.from(pngBytes);
+pngCorrupt[pngCorrupt.length - 20] ^= 0xff;
+expect(!!throwsWith(() => decodePng(pngCorrupt)), 'png-rejects-corrupt-crc', '改了 IDAT 一个字节居然没抛错，CRC 校验是装饰');
+expect(!!throwsWith(() => decodePng(pngBytes.subarray(0, pngBytes.length - 8))), 'png-rejects-truncated', '截断的 PNG 居然能解码');
+
+/* colorType 守卫要**单独**证明。直接改字节的话，报错会是 CRC 不对,也就是说
+   colorType 那一行永远轮不到，而我会以为它被验过了。所以要重算 CRC，并且断言
+   报错文案里真的提到 colorType,否则这条负向验的只是另一条守卫。 */
+const pngPalette = Buffer.from(pngBytes);
+pngPalette[8 + 8 + 9] = 3;
+const ihdrBody = pngPalette.subarray(8 + 4, 8 + 8 + 13);
+pngPalette.writeUInt32BE(crc32(ihdrBody), 8 + 8 + 13);
+const paletteErr = throwsWith(() => decodePng(pngPalette));
+expect(!!paletteErr && /colorType/.test(paletteErr), 'png-rejects-unsupported-colortype', '不支持的 colorType 没被单独拓出来，报的可能是 CRC 而不是 colorType (actual ' + JSON.stringify(paletteErr) + ')');
+
+const pngFlipped = Buffer.from(pngDecoded.data);
+pngFlipped[(2 * PW + 3) * 4] ^= 0xff;
+const pngMutant = comparePixels(pngFlipped, pngFixture, PW, PH, 0);
+expectEq(pngMutant.diff, 1, 'png-comparator-catches-one-pixel', '翻一个像素比较器没拓出来，那上面那条逐像素等号是装饰');
+expect(!!pngMutant.first && pngMutant.first.x === 3 && pngMutant.first.y === 2, 'png-comparator-reports-location', '比较器没报出不同的坐标，报告里就只有一句不相等，定不了位');
+
+/* 上面那些只证明解码器能用。真正把它接到产品上的是浏览器闸门，所以这里钉住
+   那边真的在用它,否则解码器可以完好地躺在仓里而没人调。 */
+expect(/decodePng\(/.test(verifyWebSrc), 'web-gate-decodes-png', '浏览器闸门没调 decodePng，解码器白写了');
+expect(/comparePixels\(/.test(verifyWebSrc), 'web-gate-compares-pixels', '浏览器闸门没逐像素对账');
+expect(/png-vs-canvas/.test(verifyWebSrc), 'web-gate-has-png-equality', '浏览器闸门里找不到那条 PNG 与 canvas 等号断言');
+expect(/png-comparator-not-decorative/.test(verifyWebSrc), 'web-gate-has-png-mutant', '浏览器闸门那条等号没配变异体');
+expect(/borderTopLeftRadius/.test(verifyWebSrc), 'png-inset-coupled-to-radius', '内边距必须从真实的 border-radius 推导，不能拍一个数字');
+
 expect(/report\.yml@main/.test(workflowSrc), 'shared-report-main', '回写 workflow 必须跟随上游 @main');
 expect(!/report\.yml@[0-9a-f]{40}/.test(workflowSrc), 'shared-report-not-sha', '这里不许再钉 SHA');
 expect(/set -o pipefail/.test(workflowSrc) && /\| tee /.test(workflowSrc), 'pipefail-with-tee', '| tee 会吃退出码，必须同段出现 pipefail');
@@ -151,6 +217,8 @@ expect(/schedule:\s*[\s\S]*17 3 \* \* \*/.test(workflowSrc), 'schedule-minute-no
 expect(/uses:\s+supercubegame\/ci-workflows\/.github\/workflows\/report\.yml@main/.test(workflowSrc), 'uses-shared-report', '回写必须走共享 workflow');
 expect(/marker:\s+'<!-- verify-gate -->'/.test(workflowSrc), 'marker-stable', 'marker 变了就找不到同一条评论');
 expect(/actions\/deploy-pages@v4/.test(pagesWorkflow), 'pages-deploy-exists', '在线试玩的 Pages workflow 还没接上');
+expect(/branches: \[main\]/.test(pagesWorkflow), 'pages-only-on-main', 'Pages 只能挂 main：github-pages 环境默认只允许默认分支部署');
+expect(/id="stage"/.test(pagesWorkflow) && /src\/main\.mjs/.test(pagesWorkflow), 'pages-verifies-two-anchors', '部署后的核对要同时查两个锥子，否则 404 页能让单一 grep 免费通过');
 
 const rulesLines = rules.trimEnd().split('\n').length;
 metrics.rulesLines = rulesLines;
@@ -172,7 +240,7 @@ metrics.nextDueInDays = Number.isFinite(nextDue) ? nextDue : null;
 const now = Date.now();
 const last = hb.last_scheduled_run ? Date.parse(hb.last_scheduled_run) : null;
 const ageDays = last ? Math.floor((now - last) / 86400000) : null;
-metrics.heartbeat = { state: last ? 'seen' : 'pending-first-schedule', ageDays, maxAgeDays: MAX_HEARTBEAT_AGE_DAYS, crons: ['17 3 * * *'], lastScheduledRun: hb.last_scheduled_run, lastManualRun: hb.last_manual_run };
+metrics.heartbeat = { state: last ? 'seen' : 'pending-first-schedule', ageDays: ageDays, maxAgeDays: MAX_HEARTBEAT_AGE_DAYS, crons: ['17 3 * * *'], lastScheduledRun: hb.last_scheduled_run, lastManualRun: hb.last_manual_run };
 if (last) expect(ageDays <= MAX_HEARTBEAT_AGE_DAYS, 'heartbeat-fresh-enough', '定时心跳太旧，像是 cron 已经死了');
 else ok('heartbeat-pending-first-schedule');
 
@@ -193,6 +261,7 @@ expect(/textContent/.test(mainSrc) && !/fillText|strokeText/.test(mainSrc), 'dom
 expect(/canvas\.width = size\.w[\s\S]*canvas\.height = size\.h/.test(mainSrc), 'canvas-1x1-pixels', 'canvas 必须保持 1:1 像素，不做 DPR 缩放');
 expect(/window\.__diag/.test(mainSrc), 'diag-exists', '浏览器闸门要靠只读诊断出口');
 expect(/snapshot:\s*function/.test(mainSrc) && /digest:\s*function/.test(mainSrc) && /advance:\s*function/.test(mainSrc), 'diag-shape', '诊断出口少字段了');
+expect(/stepWith:\s*function/.test(mainSrc), 'diag-has-step-with', 'stepWith 不能删：press 只设 pending，advance 不消费它，没它输入注入不进去');
 
 async function killMutants() {
   const baseUrl = 'data:text/javascript;charset=utf-8,';

@@ -4,8 +4,9 @@
 - `src/engine.mjs`: 纯核心。地图生成、碰撞、得分、机器人、诊断摘要。
 - `src/render.mjs`: 只把快照画成平色整数矩形，不做任何业务判断。
 - `src/main.mjs`: 浏览器壳。输入、循环、DOM 文案、存档、诊断出口。
-- `scripts/verify.mjs`: 快闸门。零依赖，守纯核心、结构不变量、义务和三条变异体。
-- `scripts/verify-web.mjs`: 浏览器闸门。真起页面，对账 canvas 像素、摘要、截图。
+- `scripts/verify.mjs`: 快闸门。零依赖，守纯核心、结构不变量、义务、PNG 解码器、三条变异体。
+- `scripts/verify-web.mjs`: 浏览器闸门。真起页面，对账 canvas 像素、摘要、PNG 与 canvas 同帧。
+- `scripts/png.mjs`: 零依赖 PNG 解码器 + 比较器 + 夹具编码器。zlib 是 Node 自带。
 - `scripts/compose-report.mjs`: 合成评论。回写 workflow 会拉它，不 checkout 整仓。
 - `heartbeat.json`: 定时链路的正向痕迹。
 - `docs/obligations.json`: 带期限的义务。宽限期内报剩余天数，过期判红。
@@ -23,28 +24,34 @@
 - 渲染只画平色整数矩形，不许描边、渐变、半透明、canvas 文字。
 - 文字只进 DOM，不进 canvas。像素等号断言靠这条活着。
 - canvas 保持 1:1 像素，不做 devicePixelRatio 缩放。
-- `window.__diag` 的字段名只能加不能改：浏览器闸门认这些名字。
+- `window.__diag` 的字段名只能加不能改：浏览器闸门认这些名字。`stepWith` 不能删,`press` 只设 pending，`advance` 不消费它，没它输入注入不进去。
+- 量像素之前必须先 `setPaused(true)`，而且冻结与 reset、advance 要在**同一次** evaluate 里：分两次往返会让一帧 rAF 溢进来。
+- PNG 解码器不许静默降级：位深 / 色彩类型 / 隔行 / CRC 不对一律抛错。一个尽力而为的解码器会把逐像素等号变成近似。
 - 回写 workflow 固定用 `supercubegame/ci-workflows/.github/workflows/report.yml@main`。
 - 有 `| tee` 的脚本段必须同段开 `set -o pipefail`。
+- Pages 只能挂 `main`：`github-pages` 环境默认只允许默认分支部署，挂其它分支两秒就红。
 - 心跳只在 `schedule` 或显式手动请求时写，防自触发靠结构，不靠提交信息。
 - `AGENTS.md` 和 `CLAUDE.md` 必须逐字相同。
 
 ## 耦合参数
 - `TUNING.carLen`、`row.count` 上限、`TUNING.carMinGap`: 改车长或密度，必须重算安全间距。
 - `TUNING.hopFrames` 与 `safeToLand()` 的落地窗口: 改 hop 帧数必须重算安全窗口。
-- `TUNING.cell`、`render()` 的矩形内边距、`scripts/verify-web.mjs` 的独立光栅器: 三边必须一起改，不然像素等号会红。
+- `TUNING.cell`、`render()` 的矩形内边距、`verify-web.mjs` 的参考光栅器: 三边一起改，取整语义要逐字一致。
+- `PNG_INSET = 12` 与 canvas 的 `border-radius`: 内边距必须 >= 半径 + 2，有断言从计算后样式读真值。改 CSS 就会红。
 - cron `17 3 * * *` 与 `MAX_HEARTBEAT_AGE_DAYS = 3`: 改频率必须改新鲜度上限。
 - `FPS_BASELINE` 与 `FPS_FLOOR`: 地板只抓卡死，下限不能高于基线三分之一。
-- `BOT_FRAMES = 420` 同时存在于快闸门和浏览器闸门: 改固定预算，两边一起改。
 - `PERF_MEASURED_MS = 18` 与 `PERF_BUDGET_MS = 60`: 预算留三倍余量，但别松到四倍以上。
+- `BOT_FRAMES = 420` 同时存在于两条闸门: 改固定预算，两边一起改。
 - `marker = <!-- verify-gate -->` 在 workflow 和回写评论查找器里必须逐字相同。
 
 ## 断言纪律
 - 快闸门优先等号，少用拍脑袋下限。
 - 每条关键断言最好有负向那侧，或者配一个变异体自证它真的会红。
+- 夹具自己要先自证：纯色图验不出过滤器分支，空集合验不出任何东西。
 - 报告必须自带证据：失败项要能只靠评论定位，不许只报“失败 1 项”。
 - 红了先查尺子，再查产品。夹具坏比产品坏常见得多。
 - 一条规矩被违反两次，就把它变成断言，别只写在文档里。
 
 ## 还没做完的一半
-- `docs/obligations.json` 里还剩一条义务：PNG 内容断言还欠一条解码后逐像素对账。
+- Pages 部署后那条核对**从没被观察到红过**，它现在是 YAML 里的一段 shell，离线触发不了。登记在 `docs/obligations.json`。
+- 心跳的 `last_scheduled_run` 还是 `null`，第一次定时跑过之前「cron 活着」没有任何正向证据。
