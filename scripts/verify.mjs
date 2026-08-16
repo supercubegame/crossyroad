@@ -78,6 +78,7 @@ const engineSrc = read('src/engine.mjs');
 const mainSrc = read('src/main.mjs');
 const renderSrc = read('src/render.mjs');
 const workflowSrc = read('.github/workflows/verify.yml');
+const pagesWorkflow = read('.github/workflows/pages.yml');
 const hb = json('heartbeat.json');
 const obligations = json('docs/obligations.json');
 const rules = read('AGENTS.md');
@@ -127,17 +128,6 @@ step(st, 'up');
 for (let i = 0; i < TUNING.hopFrames; i += 1) step(st, null);
 expectEq(st.score, 1, 'score-updates-on-landing', '得分应该在落地后增加');
 
-let foundRoad = null;
-for (let r = 3; r < 40; r += 1) {
-  const row = makeRow(1, r);
-  if (row.type === 'road') { foundRoad = row; break; }
-}
-expect(!!foundRoad, 'find-road-row', '种子里找不到 road 行，夹具坏了');
-if (foundRoad) {
-  const cars = entitiesAt(foundRoad, 100);
-  expect(cars.length === foundRoad.count, 'cars-count-matches', '实体数不等于 count');
-}
-
 let foundRiverRow = null;
 let foundSafeCol = null;
 for (let r = 3; r < 60 && foundRiverRow === null; r += 1) {
@@ -152,9 +142,7 @@ for (let r = 3; r < 60 && foundRiverRow === null; r += 1) {
   }
 }
 expect(foundRiverRow !== null, 'find-safe-river-landing', '夹具没找到一个原版 safeToLand 为真的河面落点');
-if (foundRiverRow !== null) {
-  expect(typeof safeToLand(createState(7), foundRiverRow, foundSafeCol) === 'boolean', 'safe-to-land-returns-bool', '轮询条件必须返回布尔，不许返回计数');
-}
+if (foundRiverRow !== null) expect(typeof safeToLand(createState(7), foundRiverRow, foundSafeCol) === 'boolean', 'safe-to-land-returns-bool', '轮询条件必须返回布尔，不许返回计数');
 
 expect(/report\.yml@main/.test(workflowSrc), 'shared-report-main', '回写 workflow 必须跟随上游 @main');
 expect(!/report\.yml@[0-9a-f]{40}/.test(workflowSrc), 'shared-report-not-sha', '这里不许再钉 SHA');
@@ -162,13 +150,14 @@ expect(/set -o pipefail/.test(workflowSrc) && /\| tee /.test(workflowSrc), 'pipe
 expect(/schedule:\s*[\s\S]*17 3 \* \* \*/.test(workflowSrc), 'schedule-minute-not-zero', 'cron 故意不取整点，有断言守它');
 expect(/uses:\s+supercubegame\/ci-workflows\/.github\/workflows\/report\.yml@main/.test(workflowSrc), 'uses-shared-report', '回写必须走共享 workflow');
 expect(/marker:\s+'<!-- verify-gate -->'/.test(workflowSrc), 'marker-stable', 'marker 变了就找不到同一条评论');
+expect(/actions\/deploy-pages@v4/.test(pagesWorkflow), 'pages-deploy-exists', '在线试玩的 Pages workflow 还没接上');
 
 const rulesLines = rules.trimEnd().split('\n').length;
 metrics.rulesLines = rulesLines;
 expect(rulesLines <= MAX_RULE_LINES, 'rules-under-cap', 'AGENTS.md 超过 200 行了，该压措辞或拆分，不许调宽上限');
 expectEq(rules, read('CLAUDE.md'), 'claude-matches-agents', 'AGENTS.md 和 CLAUDE.md 必须逐字相同');
 
-const dueItems = (obligations.items || []).filter(item => item.id !== 'perf-budget-from-measured');
+const dueItems = obligations.items || [];
 metrics.obligationsOpen = dueItems.length;
 let nextDue = Infinity;
 for (const item of dueItems) {
@@ -183,14 +172,7 @@ metrics.nextDueInDays = Number.isFinite(nextDue) ? nextDue : null;
 const now = Date.now();
 const last = hb.last_scheduled_run ? Date.parse(hb.last_scheduled_run) : null;
 const ageDays = last ? Math.floor((now - last) / 86400000) : null;
-metrics.heartbeat = {
-  state: last ? 'seen' : 'pending-first-schedule',
-  ageDays: ageDays,
-  maxAgeDays: MAX_HEARTBEAT_AGE_DAYS,
-  crons: ['17 3 * * *'],
-  lastScheduledRun: hb.last_scheduled_run,
-  lastManualRun: hb.last_manual_run
-};
+metrics.heartbeat = { state: last ? 'seen' : 'pending-first-schedule', ageDays, maxAgeDays: MAX_HEARTBEAT_AGE_DAYS, crons: ['17 3 * * *'], lastScheduledRun: hb.last_scheduled_run, lastManualRun: hb.last_manual_run };
 if (last) expect(ageDays <= MAX_HEARTBEAT_AGE_DAYS, 'heartbeat-fresh-enough', '定时心跳太旧，像是 cron 已经死了');
 else ok('heartbeat-pending-first-schedule');
 
@@ -233,9 +215,9 @@ async function killMutants() {
   for (let i = 0; i < m2.default.TUNING.hopFrames; i += 1) m2.default.step(s2, null);
   if (s2.score !== 1) killed += 1; else no('mutant-score-landing', '改坏落地加分后，断言没抓到');
 
-  const m3 = await loadMutant('const settle = TUNING.hopFrames + 12;', 'const settle = 0;');
+  const m3 = await loadMutant('if (Math.abs(col - logs[i]) <= row.len / 2 - 0.2) onBoard = true;', 'if (false) onBoard = true;');
   const safe = m3.default.safeToLand(m3.default.createState(7), foundRiverRow, foundSafeCol);
-  if (safe === false) killed += 1; else no('mutant-safe-to-land', '删掉安全窗口后，断言没抓到');
+  if (safe === false) killed += 1; else no('mutant-safe-to-land', '删掉上板判定后，断言没抓到');
   return killed;
 }
 

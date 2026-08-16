@@ -28,65 +28,45 @@ function rasterExpected(snap) {
   const w = snap.cols * cell;
   const h = snap.viewRows * cell;
   const counts = { player: 0, car: 0, log: 0, tree: 0, dead: 0, menu: 0 };
-  function addRect(kind, x, y, rw, rh) {
+  function rect(kind, x, y, rw, rh) {
     const left = clamp(Math.round(x), 0, w);
     const top = clamp(Math.round(y), 0, h);
     const right = clamp(Math.round(x + rw), 0, w);
     const bottom = clamp(Math.round(y + rh), 0, h);
-    if (right <= left || bottom <= top) return;
-    counts[kind] += (right - left) * (bottom - top);
+    if (right <= left || bottom <= top) return null;
+    return { kind, left, top, right, bottom };
   }
+  const shapes = [];
   for (const row of snap.rows) {
     const top = h - cell - (row.index * cell - snap.camPx);
     if (top >= h || top + cell <= 0) continue;
     if (row.type === 'grass') {
-      for (const tree of row.trees) addRect('tree', tree * cell, top, cell, cell);
-    } else if (row.type === 'river') {
-      for (const x of row.entities) addRect('log', (x - row.len / 2) * cell, top + 6, row.len * cell, cell - 12);
-    } else {
-      for (const x of row.entities) addRect('car', (x - row.len / 2) * cell, top + 8, row.len * cell, cell - 16);
-    }
-  }
-  const playerX = snap.player.visualX * cell + 8;
-  const playerY = h - cell - (snap.player.visualRow * cell - snap.camPx) + 8;
-  const pLeft = clamp(Math.round(playerX), 0, w);
-  const pTop = clamp(Math.round(playerY), 0, h);
-  const pRight = clamp(Math.round(playerX + cell - 16), 0, w);
-  const pBottom = clamp(Math.round(playerY + cell - 16), 0, h);
-  counts.player += Math.max(0, pRight - pLeft) * Math.max(0, pBottom - pTop);
-
-  for (const row of snap.rows) {
-    const top = h - cell - (row.index * cell - snap.camPx);
-    if (top >= h || top + cell <= 0) continue;
-    if (row.type === 'river') {
-      for (const x of row.entities) {
-        const left = clamp(Math.round((x - row.len / 2) * cell), 0, w);
-        const rt = clamp(Math.round((x - row.len / 2) * cell + row.len * cell), 0, w);
-        const tp = clamp(Math.round(top + 6), 0, h);
-        const bt = clamp(Math.round(top + 6 + cell - 12), 0, h);
-        const overlap = Math.max(0, Math.min(rt, pRight) - Math.max(left, pLeft)) * Math.max(0, Math.min(bt, pBottom) - Math.max(tp, pTop));
-        counts.log -= overlap;
-      }
-    } else if (row.type === 'road') {
-      for (const x of row.entities) {
-        const left = clamp(Math.round((x - row.len / 2) * cell), 0, w);
-        const rt = clamp(Math.round((x - row.len / 2) * cell + row.len * cell), 0, w);
-        const tp = clamp(Math.round(top + 8), 0, h);
-        const bt = clamp(Math.round(top + 8 + cell - 16), 0, h);
-        const overlap = Math.max(0, Math.min(rt, pRight) - Math.max(left, pLeft)) * Math.max(0, Math.min(bt, pBottom) - Math.max(tp, pTop));
-        counts.car -= overlap;
-      }
-    } else {
       for (const tree of row.trees) {
-        const left = clamp(Math.round(tree * cell), 0, w);
-        const rt = clamp(Math.round(tree * cell + cell), 0, w);
-        const tp = clamp(Math.round(top), 0, h);
-        const bt = clamp(Math.round(top + cell), 0, h);
-        const overlap = Math.max(0, Math.min(rt, pRight) - Math.max(left, pLeft)) * Math.max(0, Math.min(bt, pBottom) - Math.max(tp, pTop));
-        counts.tree -= overlap;
+        const s = rect('tree', tree * cell, top, cell, cell);
+        if (s) shapes.push(s);
+      }
+    } else if (row.type === 'river') {
+      for (const x of row.entities) {
+        const s = rect('log', (x - row.len / 2) * cell, top + 6, row.len * cell, cell - 12);
+        if (s) shapes.push(s);
+      }
+    } else {
+      for (const x of row.entities) {
+        const s = rect('car', (x - row.len / 2) * cell, top + 8, row.len * cell, cell - 16);
+        if (s) shapes.push(s);
       }
     }
   }
+  const player = rect('player', snap.player.visualX * cell + 8, h - cell - (snap.player.visualRow * cell - snap.camPx) + 8, cell - 16, cell - 16);
+  for (const s of shapes) {
+    let area = (s.right - s.left) * (s.bottom - s.top);
+    if (player) {
+      const overlap = Math.max(0, Math.min(s.right, player.right) - Math.max(s.left, player.left)) * Math.max(0, Math.min(s.bottom, player.bottom) - Math.max(s.top, player.top));
+      area -= overlap;
+    }
+    counts[s.kind] += area;
+  }
+  if (player) counts.player += (player.right - player.left) * (player.bottom - player.top);
   return { w, h, counts, expectedMenuPixels: w * h, expectedDeadPixels: w * 144 };
 }
 
@@ -122,23 +102,14 @@ async function main() {
     const menu = await page.locator('#menu').screenshot();
     shots.push({ name: 'menu.png', bytes: menu.length, sha: sha(menu) });
     await page.evaluate(() => window.__diag.draw());
-    const menuSnap = await page.evaluate(() => window.__diag.snapshot());
     const menuPixels = await countColor(page, PALETTE.menu);
-    const menuExpected = rasterExpected(menuSnap);
     metrics.menuPixels = menuPixels;
-    metrics.expectedMenuPixels = menuExpected.expectedMenuPixels;
-    expectEq(menuPixels, menuExpected.expectedMenuPixels, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
+    metrics.expectedMenuPixels = geo.w * geo.h;
+    expectEq(menuPixels, geo.w * geo.h, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
 
     await page.evaluate(() => window.__diag.reset(1));
-    await page.waitForFunction(() => window.__diag.phase() === 'play');
     await page.evaluate(frames => window.__diag.advance(frames, true), BOT_FRAMES);
-    await page.waitForFunction((frames) => window.__diag.snapshot().frame >= frames, BOT_FRAMES);
-    const live = await page.evaluate(() => ({
-      digest: window.__diag.digest(),
-      score: window.__diag.score(),
-      snap: window.__diag.snapshot(),
-      storage: window.__diag.storage()
-    }));
+    const live = await page.evaluate(() => ({ digest: window.__diag.digest(), score: window.__diag.score(), snap: window.__diag.snapshot(), storage: window.__diag.storage() }));
     const nodeRun = run(1, BOT_FRAMES);
     metrics.browserDigest = live.digest;
     metrics.nodeDigest = nodeRun.digest;
@@ -172,25 +143,14 @@ async function main() {
     expectEq(afterReload.best, live.score, 'best-persists', '最高分没有写回存储');
 
     await page.evaluate(() => window.__diag.reset(1));
-    await page.waitForFunction(() => window.__diag.phase() === 'play');
-    let died = false;
-    for (let i = 0; i < 80 && !died; i += 1) {
-      await page.evaluate(() => window.__diag.advance(6, true));
-      const snap = await page.evaluate(() => window.__diag.snapshot());
-      const row = snap.rows.find(r => r.type === 'road');
-      if (row && row.entities.length) {
-        const target = Math.max(0, Math.min(snap.cols - 1, Math.round(row.entities[0])));
-        const here = Math.round(snap.player.x);
-        if (here < target) await page.keyboard.press('ArrowRight');
-        else if (here > target) await page.keyboard.press('ArrowLeft');
-        else await page.keyboard.press('ArrowUp');
-      } else {
-        await page.keyboard.press('ArrowUp');
-      }
-      await page.evaluate(() => window.__diag.advance(8, false));
-      died = await page.evaluate(() => window.__diag.phase() === 'dead');
-    }
-    expect(died, 'reach-death-state', '夹具没能触发死亡，后面的死亡断言全会变空');
+    await page.evaluate(() => {
+      for (let i = 0; i < 18; i += 1) window.__diag.press('up'), window.__diag.advance(6, false), window.__diag.settle();
+      window.__diag.press('left');
+      window.__diag.advance(8, false);
+      return window.__diag.phase();
+    });
+    const died = await page.evaluate(() => window.__diag.phase() === 'dead');
+    expect(died, 'reach-death-state', '夹具没能把玩家送下河，后面的死亡断言会变空');
     if (died) {
       const deadSnap = await page.evaluate(() => window.__diag.snapshot());
       metrics.deadPixels = await countColor(page, PALETTE.dead);
