@@ -186,6 +186,16 @@ pngCorrupt[pngCorrupt.length - 20] ^= 0xff;
 expect(!!throwsWith(() => decodePng(pngCorrupt)), 'png-rejects-corrupt-crc', '改了 IDAT 一个字节居然没抛错，CRC 校验是装饰');
 expect(!!throwsWith(() => decodePng(pngBytes.subarray(0, pngBytes.length - 8))), 'png-rejects-truncated', '截断的 PNG 居然能解码');
 
+/* colorType 守卫要**单独**证明。直接改字节的话，报错会是 CRC 不对,也就是说
+   colorType 那一行永远轮不到，而我会以为它被验过了。所以要重算 CRC，并且断言
+   报错文案里真的提到 colorType,否则这条负向验的只是另一条守卫。 */
+const pngPalette = Buffer.from(pngBytes);
+pngPalette[8 + 8 + 9] = 3;
+const ihdrBody = pngPalette.subarray(8 + 4, 8 + 8 + 13);
+pngPalette.writeUInt32BE(crc32(ihdrBody), 8 + 8 + 13);
+const paletteErr = throwsWith(() => decodePng(pngPalette));
+expect(!!paletteErr && /colorType/.test(paletteErr), 'png-rejects-unsupported-colortype', '不支持的 colorType 没被单独拓出来，报的可能是 CRC 而不是 colorType (actual ' + JSON.stringify(paletteErr) + ')');
+
 const pngFlipped = Buffer.from(pngDecoded.data);
 pngFlipped[(2 * PW + 3) * 4] ^= 0xff;
 const pngMutant = comparePixels(pngFlipped, pngFixture, PW, PH, 0);
