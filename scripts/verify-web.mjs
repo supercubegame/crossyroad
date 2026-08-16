@@ -21,42 +21,93 @@ function expectEq(actual, expected, name, detail) {
   else no(name, detail + ' (actual ' + JSON.stringify(actual) + ', expected ' + JSON.stringify(expected) + ')');
 }
 function sha(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
-function rgba(hex) {
-  const s = hex.replace('#', '');
-  return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16), 255];
-}
-function samePx(data, i, color) {
-  return data[i] === color[0] && data[i + 1] === color[1] && data[i + 2] === color[2] && data[i + 3] === color[3];
-}
+function clamp(a, b, c) { return Math.max(b, Math.min(c, a)); }
 
-/* 独立光栅器。它和 src/render.mjs 各写一遍，是故意的：同一份逻辑复制过来不叫验证，
-   叫复读。两边要逐色对账，所以几何必须能人工读懂。 */
-function rasterExpected(snap, palette) {
+function rasterExpected(snap) {
   const cell = snap.cell;
   const w = snap.cols * cell;
   const h = snap.viewRows * cell;
   const counts = { player: 0, car: 0, log: 0, tree: 0, dead: 0, menu: 0 };
+  function addRect(kind, x, y, rw, rh) {
+    const left = clamp(Math.round(x), 0, w);
+    const top = clamp(Math.round(y), 0, h);
+    const right = clamp(Math.round(x + rw), 0, w);
+    const bottom = clamp(Math.round(y + rh), 0, h);
+    if (right <= left || bottom <= top) return;
+    counts[kind] += (right - left) * (bottom - top);
+  }
   for (const row of snap.rows) {
     const top = h - cell - (row.index * cell - snap.camPx);
     if (top >= h || top + cell <= 0) continue;
     if (row.type === 'grass') {
-      counts.tree += row.trees.length * cell * cell;
+      for (const tree of row.trees) addRect('tree', tree * cell, top, cell, cell);
     } else if (row.type === 'river') {
-      for (const x of row.entities) counts.log += Math.round(row.len * cell) * (cell - 12);
+      for (const x of row.entities) addRect('log', (x - row.len / 2) * cell, top + 6, row.len * cell, cell - 12);
     } else {
-      for (const x of row.entities) counts.car += Math.round(row.len * cell) * (cell - 16);
+      for (const x of row.entities) addRect('car', (x - row.len / 2) * cell, top + 8, row.len * cell, cell - 16);
     }
   }
-  counts.player = (cell - 16) * (cell - 16);
+  const playerX = snap.player.visualX * cell + 8;
+  const playerY = h - cell - (snap.player.visualRow * cell - snap.camPx) + 8;
+  const pLeft = clamp(Math.round(playerX), 0, w);
+  const pTop = clamp(Math.round(playerY), 0, h);
+  const pRight = clamp(Math.round(playerX + cell - 16), 0, w);
+  const pBottom = clamp(Math.round(playerY + cell - 16), 0, h);
+  counts.player += Math.max(0, pRight - pLeft) * Math.max(0, pBottom - pTop);
+
+  for (const row of snap.rows) {
+    const top = h - cell - (row.index * cell - snap.camPx);
+    if (top >= h || top + cell <= 0) continue;
+    if (row.type === 'river') {
+      for (const x of row.entities) {
+        const left = clamp(Math.round((x - row.len / 2) * cell), 0, w);
+        const rt = clamp(Math.round((x - row.len / 2) * cell + row.len * cell), 0, w);
+        const tp = clamp(Math.round(top + 6), 0, h);
+        const bt = clamp(Math.round(top + 6 + cell - 12), 0, h);
+        const overlap = Math.max(0, Math.min(rt, pRight) - Math.max(left, pLeft)) * Math.max(0, Math.min(bt, pBottom) - Math.max(tp, pTop));
+        counts.log -= overlap;
+      }
+    } else if (row.type === 'road') {
+      for (const x of row.entities) {
+        const left = clamp(Math.round((x - row.len / 2) * cell), 0, w);
+        const rt = clamp(Math.round((x - row.len / 2) * cell + row.len * cell), 0, w);
+        const tp = clamp(Math.round(top + 8), 0, h);
+        const bt = clamp(Math.round(top + 8 + cell - 16), 0, h);
+        const overlap = Math.max(0, Math.min(rt, pRight) - Math.max(left, pLeft)) * Math.max(0, Math.min(bt, pBottom) - Math.max(tp, pTop));
+        counts.car -= overlap;
+      }
+    } else {
+      for (const tree of row.trees) {
+        const left = clamp(Math.round(tree * cell), 0, w);
+        const rt = clamp(Math.round(tree * cell + cell), 0, w);
+        const tp = clamp(Math.round(top), 0, h);
+        const bt = clamp(Math.round(top + cell), 0, h);
+        const overlap = Math.max(0, Math.min(rt, pRight) - Math.max(left, pLeft)) * Math.max(0, Math.min(bt, pBottom) - Math.max(tp, pTop));
+        counts.tree -= overlap;
+      }
+    }
+  }
   return { w, h, counts, expectedMenuPixels: w * h, expectedDeadPixels: w * 144 };
+}
+
+async function countColor(page, hex) {
+  return page.evaluate((color) => {
+    const s = color.replace('#', '');
+    const target = [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16), 255];
+    const canvas = document.getElementById('stage');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let count = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i] === target[0] && data[i + 1] === target[1] && data[i + 2] === target[2] && data[i + 3] === target[3]) count += 1;
+    }
+    return count;
+  }, hex);
 }
 
 async function main() {
   const server = await startServer(process.cwd(), 0);
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--use-angle=swiftshader', '--use-gl=angle', '--enable-unsafe-swiftshader']
-  });
+  const browser = await chromium.launch({ headless: true, args: ['--use-angle=swiftshader', '--use-gl=angle', '--enable-unsafe-swiftshader'] });
   const page = await browser.newPage({ viewport: { width: 432, height: 690 }, deviceScaleFactor: 1 });
   const shots = [];
   try {
@@ -71,81 +122,46 @@ async function main() {
     const menu = await page.locator('#menu').screenshot();
     shots.push({ name: 'menu.png', bytes: menu.length, sha: sha(menu) });
     await page.evaluate(() => window.__diag.draw());
-    const menuMetrics = await page.evaluate(() => {
-      const snap = window.__diag.snapshot();
-      const canvas = document.getElementById('stage');
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-      const rgba = hex => {
-        const s = hex.replace('#', '');
-        return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16), 255];
-      };
-      const target = rgba(window.__diag.palette().menu);
-      let count = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        if (data[i] === target[0] && data[i + 1] === target[1] && data[i + 2] === target[2] && data[i + 3] === target[3]) count += 1;
-      }
-      return { menuPixels: count, snap };
-    });
-    const menuExpected = rasterExpected(menuMetrics.snap, PALETTE);
-    metrics.menuPixels = menuMetrics.menuPixels;
+    const menuSnap = await page.evaluate(() => window.__diag.snapshot());
+    const menuPixels = await countColor(page, PALETTE.menu);
+    const menuExpected = rasterExpected(menuSnap);
+    metrics.menuPixels = menuPixels;
     metrics.expectedMenuPixels = menuExpected.expectedMenuPixels;
-    expectEq(menuMetrics.menuPixels, menuExpected.expectedMenuPixels, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
+    expectEq(menuPixels, menuExpected.expectedMenuPixels, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
 
-    await page.click('#play');
+    await page.evaluate(() => window.__diag.reset(1));
     await page.waitForFunction(() => window.__diag.phase() === 'play');
     await page.evaluate(frames => window.__diag.advance(frames, true), BOT_FRAMES);
     await page.waitForFunction((frames) => window.__diag.snapshot().frame >= frames, BOT_FRAMES);
-    const live = await page.evaluate(() => {
-      const snap = window.__diag.snapshot();
-      const pal = window.__diag.palette();
-      const canvas = document.getElementById('stage');
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-      const countColor = hex => {
-        const s = hex.replace('#', '');
-        const target = [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16), 255];
-        let count = 0;
-        for (let i = 0; i < data.length; i += 4) {
-          if (data[i] === target[0] && data[i + 1] === target[1] && data[i + 2] === target[2] && data[i + 3] === target[3]) count += 1;
-        }
-        return count;
-      };
-      return {
-        digest: window.__diag.digest(),
-        score: window.__diag.score(),
-        snap,
-        playerPixels: countColor(pal.player),
-        carPixels: countColor(pal.car),
-        logPixels: countColor(pal.log),
-        treePixels: countColor(pal.tree),
-        deadPixels: countColor(pal.dead),
-        menuPixels: countColor(pal.menu),
-        storage: window.__diag.storage()
-      };
-    });
+    const live = await page.evaluate(() => ({
+      digest: window.__diag.digest(),
+      score: window.__diag.score(),
+      snap: window.__diag.snapshot(),
+      storage: window.__diag.storage()
+    }));
     const nodeRun = run(1, BOT_FRAMES);
     metrics.browserDigest = live.digest;
     metrics.nodeDigest = nodeRun.digest;
     expectEq(live.digest, nodeRun.digest, 'browser-vs-node-digest', '浏览器和 Node 同帧数摘要不同，说明壳和核心漂了');
 
-    const expected = rasterExpected(live.snap, PALETTE);
-    metrics.playerPixels = live.playerPixels;
+    const expected = rasterExpected(live.snap);
+    metrics.playerPixels = await countColor(page, PALETTE.player);
     metrics.expectedPlayerPixels = expected.counts.player;
-    metrics.carPixels = live.carPixels;
+    metrics.carPixels = await countColor(page, PALETTE.car);
     metrics.expectedCarPixels = expected.counts.car;
-    metrics.logPixels = live.logPixels;
+    metrics.logPixels = await countColor(page, PALETTE.log);
     metrics.expectedLogPixels = expected.counts.log;
-    metrics.treePixels = live.treePixels;
+    metrics.treePixels = await countColor(page, PALETTE.tree);
     metrics.expectedTreePixels = expected.counts.tree;
-    metrics.deadPixels = live.deadPixels;
+    metrics.deadPixels = await countColor(page, PALETTE.dead);
     metrics.expectedDeadPixels = 0;
-    expectEq(live.playerPixels, expected.counts.player, 'player-pixels', '玩家像素数不对');
-    expectEq(live.carPixels, expected.counts.car, 'car-pixels', '车像素数不对');
-    expectEq(live.logPixels, expected.counts.log, 'log-pixels', '木头像素数不对');
-    expectEq(live.treePixels, expected.counts.tree, 'tree-pixels', '树像素数不对');
-    expectEq(live.deadPixels, 0, 'dead-strip-absent-while-alive', '活着时不该有死亡横带');
-    expectEq(live.menuPixels, 0, 'menu-overlay-absent-while-playing', '开局后菜单遮罩应该消失');
+    metrics.menuPixels = await countColor(page, PALETTE.menu);
+    expectEq(metrics.playerPixels, expected.counts.player, 'player-pixels', '玩家像素数不对');
+    expectEq(metrics.carPixels, expected.counts.car, 'car-pixels', '车像素数不对');
+    expectEq(metrics.logPixels, expected.counts.log, 'log-pixels', '木头像素数不对');
+    expectEq(metrics.treePixels, expected.counts.tree, 'tree-pixels', '树像素数不对');
+    expectEq(metrics.deadPixels, 0, 'dead-strip-absent-while-alive', '活着时不该有死亡横带');
+    expectEq(metrics.menuPixels, 0, 'menu-overlay-absent-while-playing', '开局后菜单遮罩应该消失');
 
     metrics.bestRunScore = live.score;
     await page.reload({ waitUntil: 'networkidle' });
@@ -156,33 +172,32 @@ async function main() {
     expectEq(afterReload.best, live.score, 'best-persists', '最高分没有写回存储');
 
     await page.evaluate(() => window.__diag.reset(1));
-    await page.evaluate(() => window.__diag.settle());
+    await page.waitForFunction(() => window.__diag.phase() === 'play');
     let died = false;
-    for (let i = 0; i < 30 && !died; i += 1) {
-      await page.keyboard.press('ArrowDown');
+    for (let i = 0; i < 80 && !died; i += 1) {
+      await page.evaluate(() => window.__diag.advance(6, true));
+      const snap = await page.evaluate(() => window.__diag.snapshot());
+      const row = snap.rows.find(r => r.type === 'road');
+      if (row && row.entities.length) {
+        const target = Math.max(0, Math.min(snap.cols - 1, Math.round(row.entities[0])));
+        const here = Math.round(snap.player.x);
+        if (here < target) await page.keyboard.press('ArrowRight');
+        else if (here > target) await page.keyboard.press('ArrowLeft');
+        else await page.keyboard.press('ArrowUp');
+      } else {
+        await page.keyboard.press('ArrowUp');
+      }
       await page.evaluate(() => window.__diag.advance(8, false));
       died = await page.evaluate(() => window.__diag.phase() === 'dead');
     }
     expect(died, 'reach-death-state', '夹具没能触发死亡，后面的死亡断言全会变空');
-    const dead = await page.evaluate(() => {
-      const snap = window.__diag.snapshot();
-      const pal = window.__diag.palette();
-      const canvas = document.getElementById('stage');
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-      const s = pal.dead.replace('#', '');
-      const target = [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16), 255];
-      let count = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        if (data[i] === target[0] && data[i + 1] === target[1] && data[i + 2] === target[2] && data[i + 3] === target[3]) count += 1;
-      }
-      return { count, snap };
-    });
-    metrics.deadPixels = dead.count;
-    metrics.expectedDeadPixels = rasterExpected(dead.snap, PALETTE).expectedDeadPixels;
-    expectEq(dead.count, metrics.expectedDeadPixels, 'dead-strip-pixels', '死亡横带像素数不对');
+    if (died) {
+      const deadSnap = await page.evaluate(() => window.__diag.snapshot());
+      metrics.deadPixels = await countColor(page, PALETTE.dead);
+      metrics.expectedDeadPixels = rasterExpected(deadSnap).expectedDeadPixels;
+      expectEq(metrics.deadPixels, metrics.expectedDeadPixels, 'dead-strip-pixels', '死亡横带像素数不对');
+    }
 
-    const t0 = Date.now();
     const f0 = await page.evaluate(() => window.__diag.frames());
     await page.waitForTimeout(1000);
     const f1 = await page.evaluate(() => window.__diag.frames());

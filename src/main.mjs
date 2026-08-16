@@ -59,6 +59,13 @@ function writeBest() {
   }
 }
 
+function maybeStoreBest() {
+  if (state.score > best) {
+    best = state.score;
+    writeBest();
+  }
+}
+
 function randomSeed() {
   return (Math.floor(Math.random() * 4294967296)) >>> 0;
 }
@@ -74,10 +81,7 @@ function startGame(seed) {
 
 function onDeath() {
   phase = 'dead';
-  if (state.score > best) {
-    best = state.score;
-    writeBest();
-  }
+  maybeStoreBest();
   syncDom();
 }
 
@@ -109,6 +113,7 @@ function tick() {
   const input = pending;
   pending = null;
   step(state, input);
+  maybeStoreBest();
   if (state.status === 'dead' && phase === 'play') onDeath();
 }
 
@@ -189,6 +194,7 @@ window.__diag = {
     for (let i = 0; i < n; i += 1) {
       if (state.status !== 'play') break;
       step(state, useBot ? botInput(state) : null);
+      maybeStoreBest();
     }
     if (state.status === 'dead' && phase === 'play') onDeath();
     draw();
@@ -198,6 +204,7 @@ window.__diag = {
     let guard = 0;
     while (state.player.hopT !== 0 && state.status === 'play' && guard < TUNING.hopFrames + 2) {
       step(state, null);
+      maybeStoreBest();
       guard += 1;
     }
     if (state.status === 'dead' && phase === 'play') onDeath();

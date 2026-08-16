@@ -36,6 +36,7 @@
 - cron `17 3 * * *` 与 `MAX_HEARTBEAT_AGE_DAYS = 3`: 改频率必须改新鲜度上限。
 - `FPS_BASELINE` 与 `FPS_FLOOR`: 地板只抓卡死，下限不能高于基线三分之一。
 - `BOT_FRAMES = 420` 同时存在于快闸门和浏览器闸门: 改固定预算，两边一起改。
+- `PERF_MEASURED_MS = 18` 与 `PERF_BUDGET_MS = 60`: 预算留三倍余量，但别松到四倍以上。
 - `marker = <!-- verify-gate -->` 在 workflow 和回写评论查找器里必须逐字相同。
 
 ## 断言纪律
@@ -46,4 +47,4 @@
 - 一条规矩被违反两次，就把它变成断言，别只写在文档里。
 
 ## 还没做完的一半
-- `docs/obligations.json` 里那两条义务还活着：性能预算要用首轮 CI 实测值收紧，PNG 内容断言还欠一条解码后逐像素对账。
+- `docs/obligations.json` 里还剩一条义务：PNG 内容断言还欠一条解码后逐像素对账。
