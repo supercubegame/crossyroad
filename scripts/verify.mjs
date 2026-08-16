@@ -15,6 +15,7 @@ const BOT_FRAMES = 420;
 const MUTANT_EXPECTATIONS = 3;
 const PNG_FILTERS = [0, 1, 2, 3, 4];
 const CRC32_IEND = 0xae426082;
+const PAGES_NEGATIVE_MIN = 4;
 const fail = [];
 const pass = [];
 const metrics = {};
@@ -212,9 +213,12 @@ expect(/borderTopLeftRadius/.test(verifyWebSrc), 'png-inset-coupled-to-radius', 
    却从没被观察到红过。而一条从没红过的断言和一条空断言，在面板上分不出来。
 
    正向样本用的是仓里真实的 index.html，不是手写夹具,后者会跟着我一起改，
-   而那正是这个病本身。改 canvas 的 id 或改脚本路径，下面第一条会红。 */
+   而那正是这个病本身。改 canvas 的 id 或改脚本路径，下面第一条会红。
+
+   负向样本数是**数出来的**，不是凭印象填的。摆在报告里的 undefined 没人会看。 */
 
 const pagesOk = checkPageHtml(indexHtml);
+let pagesNegatives = 0;
 metrics.pagesAnchors = ANCHORS.map(a => a.id);
 metrics.pagesPositiveBytes = pagesOk.bytes;
 expect(pagesOk.ok, 'pages-guard-accepts-real-index', '守卫把仓里真实的 index.html 判成不合格，锥子和页面已经对不上了（缺 ' + pagesOk.missing.join(',') + '）');
@@ -223,20 +227,26 @@ expect(ANCHORS.length >= 2, 'pages-guard-has-two-anchors', '只留一个锥子�
 /* 负向一：一个真实形状的 404 页。它必须被判红，而且两个锥子都缺。 */
 const sample404 = '<!doctype html><html><head><title>404</title></head><body><h1>404</h1><p>File not found</p><p>The site configured at this address does not contain the requested file.</p></body></html>';
 const res404 = checkPageHtml(sample404);
+pagesNegatives += 1;
 expect(!res404.ok, 'pages-guard-rejects-404', '404 页居然被判成部署成功');
 expectEq(res404.missing.length, ANCHORS.length, 'pages-guard-404-misses-all-anchors', '404 页应该两个锥子都缺');
 
-/* 负向二（承重的那条）：只有一个锥子的页。它证明单一 grep 会被您放过,
-   而这正是当初担心的那种假绿。两个方向各做一次，避开“恰好只守住了第一个”。 */
+/* 负向二（承重的那条）：只有一个锥子的页。它证明单一 grep 会被放过，
+   而这正是当初担心的那种假绿。两个方向各做一次，避开「恰好只守住了第一个」。 */
 for (const anchor of ANCHORS) {
   const partial = '<!doctype html><html><body>' + anchor.needle + '</body></html>';
   const res = checkPageHtml(partial);
+  pagesNegatives += 1;
   expect(!res.ok, 'pages-guard-rejects-only-' + anchor.id, '只有 ' + anchor.id + ' 一个锥子的页居然被判成成功，单一 grep 就是这么被骗的');
   expectEq(res.missing.length, 1, 'pages-guard-reports-which-anchor-' + anchor.id, '应该恰好报缺一个锥子，否则报告定不了位');
 }
 
 const resEmpty = checkPageHtml('');
+pagesNegatives += 1;
 expect(!resEmpty.ok, 'pages-guard-rejects-empty', '空响应居然被判成部署成功，那整个网络失败都会静默通过');
+
+metrics.pagesNegativeSamples = pagesNegatives;
+expect(Number.isFinite(pagesNegatives) && pagesNegatives >= PAGES_NEGATIVE_MIN, 'pages-negative-sample-count', '负向样本数不对：404 + 两个单锥子 + 空响应应该至少 ' + PAGES_NEGATIVE_MIN + ' 个 (actual ' + JSON.stringify(pagesNegatives) + ')');
 
 expect(/node scripts\/pages-check\.mjs/.test(pagesWorkflow), 'pages-workflow-calls-script', 'Pages workflow 没调那个脚本，上面那几个样本验的就不是真跑的那段');
 expect(!/grep -q/.test(pagesWorkflow), 'pages-workflow-no-inline-grep', '行内 grep 回来了：那段离线触发不了，也就永远不会被观察到红');
