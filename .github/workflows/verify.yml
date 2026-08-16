@@ -1,0 +1,132 @@
+name: verify
+
+on:
+  push:
+    branches: ['**']
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      write_heartbeat:
+        description: 手动验一次心跳链路（写进 last_manual_run，不参与新鲜度判定）
+        type: boolean
+        default: false
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: 引擎闸门
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 跑引擎闸门
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          npm run verify 2>&1 | tee artifacts/stdout-eng.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-eng
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: 失败则让 job 失败
+        if: steps.gate.outcome != 'success'
+        run: exit 1
+
+  web:
+    name: 浏览器闸门
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 装依赖
+        run: npm install --no-audit --no-fund
+      - name: 装字体
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+      - name: 装 Chromium
+        run: npx playwright install --with-deps chromium
+      - name: 跑浏览器闸门
+        id: web
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          npm run verify:web 2>&1 | tee artifacts/stdout-web.log
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-web
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: 失败则让 job 失败
+        if: steps.web.outcome != 'success'
+        run: exit 1
+
+  heartbeat:
+    name: 写心跳
+    needs: [gate, web]
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.write_heartbeat))
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 盖戳
+        env:
+          EVENT: ${{ github.event_name }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          WEB_RESULT: ${{ needs.web.result }}
+        run: node scripts/write-heartbeat.mjs
+      - name: 推回主干
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add heartbeat.json
+          if git diff --cached --quiet; then
+            echo '心跳内容没变化，不造空提交'
+            exit 0
+          fi
+          git commit -m '心跳：定时闸门跑过了'
+          git push origin HEAD:main
+
+  report:
+    name: 回报结果
+    needs: [gate, web]
+    if: always()
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: supercubegame/ci-workflows/.github/workflows/report.yml@main
+    with:
+      node-version: '22'
+      gates: '[{"name":"引擎闸门","result":"${{ needs.gate.result }}"},{"name":"浏览器闸门","result":"${{ needs.web.result }}"}]'
+      composer-files: scripts/compose-report.mjs
+      composer-entry: scripts/compose-report.mjs
+      marker: '<!-- verify-gate -->'

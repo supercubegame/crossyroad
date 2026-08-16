@@ -1,0 +1,17 @@
+{
+  "name": "crossyroad",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CROSSYROAD - 网页版天天过马路，纯核心引擎 + 无头验证闸门",
+  "scripts": {
+    "verify": "node scripts/verify.mjs",
+    "verify:web": "node scripts/verify-web.mjs",
+    "serve": "node scripts/serve.mjs",
+    "report": "node scripts/compose-report.mjs reports",
+    "heartbeat": "node scripts/write-heartbeat.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.47.0"
+  }
+}
