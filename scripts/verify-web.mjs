@@ -25,8 +25,8 @@ function sha(buf) { return crypto.createHash('sha256').update(buf).digest('hex')
 
 /* 参考光栅器。从快照出发，用自己一份绘制代码真画一张位图，然后数颜色。
 
-   上一版是算面积账，连错两轮（车少算、木头多算），根因同一个：面积账要手工重现
-   绘制顺序和遮挡关系，而那是一笔算不清的账。画一遍再数，遮挡由构造正确。
+   上一版是算面积账，连错两轮，根因同一个：面积账要手工重现绘制顺序和遮挡关系，
+   而那是一笔算不清的账。画一遍再数，遮挡由构造正确。
 
    它不验什么：不验配色好看、不验布局合理。它验三件事，画出来了、几何没歪、
    画面已经追上了状态。好不好玩机器判不了，也不该假装能判。
@@ -116,12 +116,19 @@ async function main() {
     expectEq(metrics.menuPixels, menuRef.counts.menu, 'menu-overlay-pixels', '菜单遮罩应该盖满整个画布');
     expect(menuRef.counts.menu === geo.w * geo.h, 'menu-reference-selftest', '参考光栅器自己就算错了菜单遮罩');
 
+    /* 冻住循环再量像素。不冻的后果已经在 CI 上看到两轮：rAF 循环在我读完
+       摘要之后继续推帧，于是摘要和像素根本不是同一帧。证据很硬：两轮的摘要
+       逐字相同，而车像素一个 32736 一个 32960。
+       注意先冻后面那条帧率断言就会盯着一个静止的世界等到超时，所以测帧率之前
+       要显式解冻，并且那条断言自己先确认循环在跑。 */
     await page.evaluate(() => window.__diag.reset(1));
+    await page.evaluate(() => window.__diag.setPaused(true));
     await page.evaluate(frames => window.__diag.advance(frames, true), BOT_FRAMES);
-    const live = await page.evaluate(() => ({ digest: window.__diag.digest(), score: window.__diag.score(), snap: window.__diag.snapshot(), phase: window.__diag.phase() }));
+    const live = await page.evaluate(() => ({ digest: window.__diag.digest(), score: window.__diag.score(), snap: window.__diag.snapshot(), phase: window.__diag.phase(), frame: window.__diag.snapshot().frame }));
     const nodeRun = run(1, BOT_FRAMES);
     metrics.browserDigest = live.digest;
     metrics.nodeDigest = nodeRun.digest;
+    metrics.frameAtMeasure = live.frame;
     expectEq(live.digest, nodeRun.digest, 'browser-vs-node-digest', '浏览器和 Node 同帧数摘要不同，说明壳和核心漂了');
 
     const ref = referenceRaster(live.snap, live.phase);
@@ -136,6 +143,11 @@ async function main() {
     metrics.deadPixels = await countColor(page, PALETTE.dead);
     metrics.expectedDeadPixels = ref.counts.dead;
     metrics.menuPixelsInPlay = await countColor(page, PALETTE.menu);
+    const carAgain = await countColor(page, PALETTE.car);
+    const frameAfter = await page.evaluate(() => window.__diag.snapshot().frame);
+    metrics.frameAfterMeasure = frameAfter;
+    expectEq(frameAfter, live.frame, 'frame-stable-during-measurement', '量像素期间世界又跑了，摘要和画面不是同一帧');
+    expectEq(carAgain, metrics.carPixels, 'redraw-idempotent', '同一状态重读两次像素数就变了，渲染本身在抖');
     expectEq(metrics.playerPixels, ref.counts.player, 'player-pixels', '玩家像素数不对');
     expectEq(metrics.carPixels, ref.counts.car, 'car-pixels', '车像素数不对');
     expectEq(metrics.logPixels, ref.counts.log, 'log-pixels', '木头像素数不对');
@@ -153,6 +165,7 @@ async function main() {
     expectEq(afterReload.best, live.score, 'best-persists', '最高分没有写回存储');
 
     await page.evaluate(() => window.__diag.reset(1));
+    await page.evaluate(() => window.__diag.setPaused(true));
     let deathState = null;
     for (let i = 0; i < DEATH_ATTEMPTS; i += 1) {
       deathState = await page.evaluate(hop => window.__diag.stepWith('up', hop + 2), TUNING.hopFrames);
@@ -174,16 +187,6 @@ async function main() {
       no('dead-reference-non-empty', '根因在前面那条 reach-death-state，先看它的证据');
     }
 
-    const f0 = await page.evaluate(() => window.__diag.frames());
-    await page.waitForTimeout(1000);
-    const f1 = await page.evaluate(() => window.__diag.frames());
-    const fps = f1 - f0;
-    metrics.fps = fps;
-    metrics.fpsFloor = FPS_FLOOR;
-    metrics.fpsBaseline = FPS_BASELINE;
-    expect(fps >= FPS_FLOOR, 'fps-floor', '帧率太低，像是循环卡住了');
-    expect(FPS_FLOOR <= Math.floor(FPS_BASELINE / 3), 'fps-floor-not-too-tight', '帧率下限太紧，会制造假红');
-
     const playShot = await page.locator('#stage').screenshot();
     shots.push({ name: 'play.png', bytes: playShot.length, sha: sha(playShot) });
     const deadShot = await page.locator('#wrap').screenshot();
@@ -191,6 +194,22 @@ async function main() {
     metrics.shots = shots;
     expect(shots.every(s => s.bytes > 0), 'shots-non-empty', '截图有空壳');
     expect(new Set(shots.map(s => s.sha)).size === shots.length, 'shots-distinct', '几张图居然一模一样，像是截图采在同一帧冻结状态');
+
+    /* 前面把循环冻住了，这里必须显式解冻，并且先自证它真的在跑,
+       否则下面那条帧率断言会盯着一个静止的计数器，而报告里只会写「帧率太低」。 */
+    await page.evaluate(() => window.__diag.reset(1));
+    await page.evaluate(() => window.__diag.setPaused(false));
+    const running = await page.evaluate(() => window.__diag.running());
+    expect(running, 'loop-resumed-before-fps', '循环没有解冻，帧率断言会报一个假的低帧率');
+    const f0 = await page.evaluate(() => window.__diag.frames());
+    await page.waitForTimeout(1000);
+    const f1 = await page.evaluate(() => window.__diag.frames());
+    const fps = f1 - f0;
+    metrics.fps = fps;
+    metrics.fpsFloor = FPS_FLOOR;
+    metrics.fpsBaseline = FPS_BASELINE;
+    expect(fps >= FPS_FLOOR, 'fps-floor', '帧率太低，像是循环卡住了（循环在跑：' + running + '）');
+    expect(FPS_FLOOR <= Math.floor(FPS_BASELINE / 3), 'fps-floor-not-too-tight', '帧率下限太紧，会制造假红');
 
     fs.mkdirSync('artifacts', { recursive: true });
     fs.writeFileSync('artifacts/menu.png', menu);
