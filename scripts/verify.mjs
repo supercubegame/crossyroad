@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { createState, step, run, makeRow, rowType, entitiesAt, TUNING, safeToLand } from '../src/engine.mjs';
 import { PALETTE, PROBE_COLORS } from '../src/palette.mjs';
 import { crc32, decodePng, encodePng, comparePixels, distinctColors } from './png.mjs';
+import { ANCHORS, checkPageHtml } from './pages-check.mjs';
 
 const PERF_FRAMES = 20000;
 const PERF_BUDGET_MS = 60;
@@ -86,6 +87,7 @@ const renderSrc = read('src/render.mjs');
 const verifyWebSrc = read('scripts/verify-web.mjs');
 const workflowSrc = read('.github/workflows/verify.yml');
 const pagesWorkflow = read('.github/workflows/pages.yml');
+const indexHtml = read('index.html');
 const hb = json('heartbeat.json');
 const obligations = json('docs/obligations.json');
 const rules = read('AGENTS.md');
@@ -167,7 +169,6 @@ for (let y = 0; y < PH; y += 1) {
     pngFixture[i + 3] = 255;
   }
 }
-/* 夹具自证：纯色图会让五种过滤器分支互相掩盖（预测器全部算出同一个值）。 */
 expect(distinctColors(pngFixture, PW, PH, 0) > 10, 'png-fixture-not-flat', 'PNG 夹具颜色太少，过滤器分支验不出东西');
 
 const pngBytes = encodePng(PW, PH, pngFixture, PNG_FILTERS);
@@ -186,9 +187,6 @@ pngCorrupt[pngCorrupt.length - 20] ^= 0xff;
 expect(!!throwsWith(() => decodePng(pngCorrupt)), 'png-rejects-corrupt-crc', '改了 IDAT 一个字节居然没抛错，CRC 校验是装饰');
 expect(!!throwsWith(() => decodePng(pngBytes.subarray(0, pngBytes.length - 8))), 'png-rejects-truncated', '截断的 PNG 居然能解码');
 
-/* colorType 守卫要**单独**证明。直接改字节的话，报错会是 CRC 不对,也就是说
-   colorType 那一行永远轮不到，而我会以为它被验过了。所以要重算 CRC，并且断言
-   报错文案里真的提到 colorType,否则这条负向验的只是另一条守卫。 */
 const pngPalette = Buffer.from(pngBytes);
 pngPalette[8 + 8 + 9] = 3;
 const ihdrBody = pngPalette.subarray(8 + 4, 8 + 8 + 13);
@@ -202,13 +200,46 @@ const pngMutant = comparePixels(pngFlipped, pngFixture, PW, PH, 0);
 expectEq(pngMutant.diff, 1, 'png-comparator-catches-one-pixel', '翻一个像素比较器没拓出来，那上面那条逐像素等号是装饰');
 expect(!!pngMutant.first && pngMutant.first.x === 3 && pngMutant.first.y === 2, 'png-comparator-reports-location', '比较器没报出不同的坐标，报告里就只有一句不相等，定不了位');
 
-/* 上面那些只证明解码器能用。真正把它接到产品上的是浏览器闸门，所以这里钉住
-   那边真的在用它,否则解码器可以完好地躺在仓里而没人调。 */
 expect(/decodePng\(/.test(verifyWebSrc), 'web-gate-decodes-png', '浏览器闸门没调 decodePng，解码器白写了');
 expect(/comparePixels\(/.test(verifyWebSrc), 'web-gate-compares-pixels', '浏览器闸门没逐像素对账');
 expect(/png-vs-canvas/.test(verifyWebSrc), 'web-gate-has-png-equality', '浏览器闸门里找不到那条 PNG 与 canvas 等号断言');
 expect(/png-comparator-not-decorative/.test(verifyWebSrc), 'web-gate-has-png-mutant', '浏览器闸门那条等号没配变异体');
 expect(/borderTopLeftRadius/.test(verifyWebSrc), 'png-inset-coupled-to-radius', '内边距必须从真实的 border-radius 推导，不能拍一个数字');
+
+/* ---------- Pages 守卫：用必然失败的样本证明它会红 ----------
+
+   之前它是 YAML 里的一段 grep 循环，离线触发不了，所以它在 main 上跑过一次并通过，
+   却从没被观察到红过。而一条从没红过的断言和一条空断言，在面板上分不出来。
+
+   正向样本用的是仓里真实的 index.html，不是手写夹具,后者会跟着我一起改，
+   而那正是这个病本身。改 canvas 的 id 或改脚本路径，下面第一条会红。 */
+
+const pagesOk = checkPageHtml(indexHtml);
+metrics.pagesAnchors = ANCHORS.map(a => a.id);
+metrics.pagesPositiveBytes = pagesOk.bytes;
+expect(pagesOk.ok, 'pages-guard-accepts-real-index', '守卫把仓里真实的 index.html 判成不合格，锥子和页面已经对不上了（缺 ' + pagesOk.missing.join(',') + '）');
+expect(ANCHORS.length >= 2, 'pages-guard-has-two-anchors', '只留一个锥子的话，404 页恰巧含有那个字串就能免费通过');
+
+/* 负向一：一个真实形状的 404 页。它必须被判红，而且两个锥子都缺。 */
+const sample404 = '<!doctype html><html><head><title>404</title></head><body><h1>404</h1><p>File not found</p><p>The site configured at this address does not contain the requested file.</p></body></html>';
+const res404 = checkPageHtml(sample404);
+expect(!res404.ok, 'pages-guard-rejects-404', '404 页居然被判成部署成功');
+expectEq(res404.missing.length, ANCHORS.length, 'pages-guard-404-misses-all-anchors', '404 页应该两个锥子都缺');
+
+/* 负向二（承重的那条）：只有一个锥子的页。它证明单一 grep 会被您放过,
+   而这正是当初担心的那种假绿。两个方向各做一次，避开“恰好只守住了第一个”。 */
+for (const anchor of ANCHORS) {
+  const partial = '<!doctype html><html><body>' + anchor.needle + '</body></html>';
+  const res = checkPageHtml(partial);
+  expect(!res.ok, 'pages-guard-rejects-only-' + anchor.id, '只有 ' + anchor.id + ' 一个锥子的页居然被判成成功，单一 grep 就是这么被骗的');
+  expectEq(res.missing.length, 1, 'pages-guard-reports-which-anchor-' + anchor.id, '应该恰好报缺一个锥子，否则报告定不了位');
+}
+
+const resEmpty = checkPageHtml('');
+expect(!resEmpty.ok, 'pages-guard-rejects-empty', '空响应居然被判成部署成功，那整个网络失败都会静默通过');
+
+expect(/node scripts\/pages-check\.mjs/.test(pagesWorkflow), 'pages-workflow-calls-script', 'Pages workflow 没调那个脚本，上面那几个样本验的就不是真跑的那段');
+expect(!/grep -q/.test(pagesWorkflow), 'pages-workflow-no-inline-grep', '行内 grep 回来了：那段离线触发不了，也就永远不会被观察到红');
 
 expect(/report\.yml@main/.test(workflowSrc), 'shared-report-main', '回写 workflow 必须跟随上游 @main');
 expect(!/report\.yml@[0-9a-f]{40}/.test(workflowSrc), 'shared-report-not-sha', '这里不许再钉 SHA');
@@ -218,7 +249,6 @@ expect(/uses:\s+supercubegame\/ci-workflows\/.github\/workflows\/report\.yml@mai
 expect(/marker:\s+'<!-- verify-gate -->'/.test(workflowSrc), 'marker-stable', 'marker 变了就找不到同一条评论');
 expect(/actions\/deploy-pages@v4/.test(pagesWorkflow), 'pages-deploy-exists', '在线试玩的 Pages workflow 还没接上');
 expect(/branches: \[main\]/.test(pagesWorkflow), 'pages-only-on-main', 'Pages 只能挂 main：github-pages 环境默认只允许默认分支部署');
-expect(/id="stage"/.test(pagesWorkflow) && /src\/main\.mjs/.test(pagesWorkflow), 'pages-verifies-two-anchors', '部署后的核对要同时查两个锥子，否则 404 页能让单一 grep 免费通过');
 
 const rulesLines = rules.trimEnd().split('\n').length;
 metrics.rulesLines = rulesLines;
