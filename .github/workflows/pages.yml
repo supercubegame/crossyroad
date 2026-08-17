@@ -3,7 +3,10 @@
 #
 # 部署完要回头读一遍那个 URL：推上去不等于玩得到。那段逻辑已经搬去
 # scripts/pages-check.mjs，因为写在这里的 shell 离线触发不了,而一条从没红过的
-# 断言和一条空断言分不出来。现在快闸门里有两个必然失败的样本在验它。
+# 断言和一条空断言分不出来。现在快闸门里有四个必然失败的样本在验它。
+#
+# **两份配置的 action 大版本要一起升。** 只升一边的话，两条流水线会跑在不同
+# Node 大版本上，而两边都绿,行为已经分叉而没任何东西在喊。
 name: pages
 
 on:
@@ -29,10 +32,11 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
+          package-manager-cache: false
       - uses: actions/configure-pages@v5
       - name: 打包静态站
         shell: bash
