@@ -8,6 +8,10 @@ name: verify
 # 频率故意取每天而不是每周：写得越勤，“读到的痕迹有多旧”就越不依赖两个定时
 # 之间的先后顺序,而那个顺序是个假设。实测过一次平台延迟近一小时。
 # cron 频率与新鲜度上限是一组耦合参数。
+#
+# **action 的大版本是上游漂移的一个入口。** Node 20 已经 deprecated，现在只是
+# warning，总有一天会变成硬失败。升到 v5（Node 24）是有意的摩擦：手动 bump，
+# 而不是钉浮动引用让它自己悄悄变。
 on:
   push:
     branches: ['**']
@@ -30,10 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
+          package-manager-cache: false
       - name: 跑引擎闸门
         id: gate
         continue-on-error: true
@@ -44,7 +49,7 @@ jobs:
           npm run verify 2>&1 | tee artifacts/stdout-eng.log
       - name: 上传报告
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: report-eng
           path: artifacts/
@@ -59,10 +64,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
+          package-manager-cache: false
       - name: 装依赖
         run: npm install --no-audit --no-fund
       - name: 装字体
@@ -79,7 +85,7 @@ jobs:
           npm run verify:web 2>&1 | tee artifacts/stdout-web.log
       - name: 上传报告
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: report-web
           path: artifacts/
@@ -121,12 +127,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
+          package-manager-cache: false
 
       - name: 盖戳
         env:
