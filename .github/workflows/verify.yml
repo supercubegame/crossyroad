@@ -1,5 +1,13 @@
 name: verify
 
+# 只挂 push 曾经够用，现在不够：没人推代码的时候，上游（共享回写 workflow、
+# Playwright、runner 镜像）改了行为，而闸门仍然“全绿”，因为它压根没跑。
+# 外部结构漂移是时间驱动的，所以除了 push 还要挂定时。
+#
+# 分钟数故意不取整点（整点是平台排队高峰），有一条断言守着。
+# 频率故意取每天而不是每周：写得越勤，“读到的痕迹有多旧”就越不依赖两个定时
+# 之间的先后顺序,而那个顺序是个假设。实测过一次平台延迟近一小时。
+# cron 频率与新鲜度上限是一组耦合参数。
 on:
   push:
     branches: ['**']
@@ -81,6 +89,29 @@ jobs:
         if: steps.web.outcome != 'success'
         run: exit 1
 
+  # ==========================================================================
+  # 心跳。它存在的理由只有一个：平台会因为仓库长期不活跃**静默停用定时
+  # 工作流**，而那时 workflow 文件一个字都不会变,“读配置确认 cron 还在”这条
+  # 检查会在它本该抓住的那次失效上保持绿色。“没有坏消息”和“已经死了”
+  # 长得一模一样，带时间戳的正向痕迹不会。
+  #
+  # 它已经兑现过一次：某次 UI 的 event 过滤器回报“0 条定时运行”，而这份文件里
+  # 已经有 schedule 盖的戳。两个读取通道打架时，正向痕迹赢了。
+  #
+  # 三个设计点，每一个都有断言在守：
+  #
+  # 1. **always()**,闸门红也要盖戳。心跳回答的是“这条链还活着吗”，
+  #    不是“产品对不对”。两件事混在一起的话，一次真失败会伪装成一条死 cron。
+  # 2. **防自触发靠结构，不靠提交信息里的跳过标记。** 这一步只在 schedule
+  #    或显式手动请求时执行，它推出去的提交触发的是普通 push，那一次永远不写。
+  #    循环由构造终止。这一条已经实测过：心跳提交触发了一次 push 运行，而它没再写。
+  # 3. **手动那条路写的是另一个字段。** 新鲜度只读 last_scheduled_run,
+  #    一次手动盖戳不得救活一条已经死掉的 cron。
+  #
+  # **提交信息的措辞与事件是一组耦合参数。** 它已经说过一次谎：手动跑的那次
+  # 写的也是“定时闸门跑过了”。现在措辞从 $EVENT 派生，并且有四条断言守着,
+  # 包括一条承重的负向：提交命令里不许再出现字面量。
+  # ==========================================================================
   heartbeat:
     name: 写心跳
     needs: [gate, web]
@@ -96,14 +127,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+
       - name: 盖戳
         env:
           EVENT: ${{ github.event_name }}
           GATE_RESULT: ${{ needs.gate.result }}
           WEB_RESULT: ${{ needs.web.result }}
         run: node scripts/write-heartbeat.mjs
+
+      # 这里不能写 `git diff --cached --quiet && echo ... && exit 0`：开了 set -e 之后，
+      # diff 发现有改动时返回 1，整个 && 链的退出码就是 1，步骤反而失败。
       - name: 推回主干
         shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -113,7 +150,12 @@ jobs:
             echo '心跳内容没变化，不造空提交'
             exit 0
           fi
-          git commit -m '心跳：定时闸门跑过了'
+          if [ "$EVENT" = 'schedule' ]; then
+            msg="心跳：定时闸门跑过了"
+          else
+            msg="心跳：手动验了一次链路（$EVENT，不参与新鲜度判定）"
+          fi
+          git commit -m "$msg"
           git push origin HEAD:main
 
   report:
