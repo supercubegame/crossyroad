@@ -16,9 +16,27 @@ const MUTANT_EXPECTATIONS = 3;
 const PNG_FILTERS = [0, 1, 2, 3, 4];
 const CRC32_IEND = 0xae426082;
 const PAGES_NEGATIVE_MIN = 4;
-/* 两份 workflow 里都会出现的官方 action。它们的大版本必须逐个相等,
-   只升一边是这类 bump 最容易的失败方式，而它全绿。 */
-const SHARED_ACTIONS = ['actions/checkout', 'actions/setup-node'];
+
+/* 官方 action 的大版本下限登记表。
+
+   **这是一个代理量，不是真值。** 我在乎的是“它跑在哪个 Node 上”，而那个值写在
+   远程仓库的 action.yml 里（runs.using），从本仓内部读不到。所以这里只能钉版本号。
+
+   下限的来源必须是 **runner 的注解**，不是发布说明。实测过一次：upload-artifact v5
+   的 release notes 写着支持 Node 24，而 runner 说它仍然 target Node 20；v6 的说明
+   自己承认了这件事。官方文档也是一份抄本。
+
+   所以每次 bump 之后要回头读一遍 runner 注解再改这里的数，而不是反过来。 */
+const ACTION_FLOORS = {
+  'actions/checkout': 5,
+  'actions/setup-node': 5,
+  'actions/upload-artifact': 7,
+  'actions/configure-pages': 5,
+  'actions/upload-pages-artifact': 3,
+  'actions/deploy-pages': 4
+};
+const ACTION_MIN_FOUND = 6;
+
 const fail = [];
 const pass = [];
 const metrics = {};
@@ -42,18 +60,19 @@ function throwsWith(fn) {
   try { fn(); return null; } catch (err) { return String(err && err.message || err); }
 }
 
-/* 从一份 YAML 里抽出某个 action 用到的大版本集合。返回排序后的字串，方便做等号。 */
-function actionMajors(yaml, action) {
-  const found = new Set();
-  const lines = yaml.split('\n');
-  for (const line of lines) {
-    const idx = line.indexOf(action + '@v');
-    if (idx < 0) continue;
-    const rest = line.slice(idx + action.length + 2);
-    const m = rest.match(/^(\d+)/);
-    if (m) found.add(m[1]);
+/* 枚举一份 YAML 里用到的所有官方 action 与它们的大版本。
+   返回 Map<name, Set<major>>。读具体行，不对整段做子串匹配。 */
+function usedActions(yaml) {
+  const out = new Map();
+  for (const line of yaml.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) continue;
+    const m = trimmed.match(/uses:\s*(actions\/[a-z0-9-]+)@v(\d+)/);
+    if (!m) continue;
+    if (!out.has(m[1])) out.set(m[1], new Set());
+    out.get(m[1]).add(Number(m[2]));
   }
-  return Array.from(found).sort().join(',');
+  return out;
 }
 
 function stripComments(js) {
@@ -224,15 +243,7 @@ expect(/png-vs-canvas/.test(verifyWebSrc), 'web-gate-has-png-equality', '浏览�
 expect(/png-comparator-not-decorative/.test(verifyWebSrc), 'web-gate-has-png-mutant', '浏览器闸门那条等号没配变异体');
 expect(/borderTopLeftRadius/.test(verifyWebSrc), 'png-inset-coupled-to-radius', '内边距必须从真实的 border-radius 推导，不能拍一个数字');
 
-/* ---------- Pages 守卫：用必然失败的样本证明它会红 ----------
-
-   之前它是 YAML 里的一段 grep 循环，离线触发不了，所以它在 main 上跑过一次并通过，
-   却从没被观察到红过。而一条从没红过的断言和一条空断言，在面板上分不出来。
-
-   正向样本用的是仓里真实的 index.html，不是手写夹具,后者会跟着我一起改，
-   而那正是这个病本身。改 canvas 的 id 或改脚本路径，下面第一条会红。
-
-   负向样本数是**数出来的**，不是凭印象填的。摆在报告里的 undefined 没人会看。 */
+/* ---------- Pages 守卫：用必然失败的样本证明它会红 ---------- */
 
 const pagesOk = checkPageHtml(indexHtml);
 let pagesNegatives = 0;
@@ -265,42 +276,66 @@ expect(Number.isFinite(pagesNegatives) && pagesNegatives >= PAGES_NEGATIVE_MIN, 
 expect(/node scripts\/pages-check\.mjs/.test(pagesWorkflow), 'pages-workflow-calls-script', 'Pages workflow 没调那个脚本，上面那几个样本验的就不是真跑的那段');
 expect(!/grep -q/.test(pagesWorkflow), 'pages-workflow-no-inline-grep', '行内 grep 回来了：那段离线触发不了，也就永远不会被观察到红');
 
-/* ---------- 心跳提交信息：它已经说过一次谎 ----------
-
-   手动跑的那次，提交信息也写着「定时闸门跑过了」。而 git log 恰好是这个仓里
-   最没人复核的那份散文。
-
-   四条里**负向那条是承重的**：光断言「用了变量」是空的,一行字面量加一行变量
-   并存同样通过。 */
+/* ---------- 心跳提交信息：它已经说过一次谎 ---------- */
 
 const commitCmdLines = workflowSrc.split('\n').filter(l => l.includes('git commit -m'));
 metrics.heartbeatCommitCommands = commitCmdLines.length;
 expectEq(commitCmdLines.length, 1, 'heartbeat-one-commit-command', '心跳只该有一条提交命令，多出来的那条会绕过下面几条断言');
 expect(/git commit -m "\$msg"/.test(workflowSrc), 'heartbeat-message-from-variable', '提交信息必须来自变量，不能是写死的一句话');
-expect(!commitCmdLines.some(l => /[\u4e00-\u9fff]/.test(l)), 'heartbeat-message-not-literal', '提交命令那行里出现中文了，那就是写死的措辞：手动跑时它会谢「定时闸门跑过了」');
+expect(!commitCmdLines.some(l => /[\u4e00-\u9fff]/.test(l)), 'heartbeat-message-not-literal', '提交命令那行里出现中文了，那就是写死的措辞：手动跑时它会说「定时闸门跑过了」');
 expect(/if \[ "\$EVENT" = 'schedule' \]/.test(workflowSrc), 'heartbeat-message-branches-on-event', '措辞必须按 $EVENT 分叉，否则两种触发写出同一句话');
 
-/* ---------- 两份 workflow 的 action 大版本要钉在一起 ----------
+/* ---------- action 大版本：白名单 + 下限 ----------
 
-   只升一边是这类 bump 最容易的失败方式，而它全绿：两条流水线跑在不同 Node
-   大版本上，行为已经分叉而没任何东西在喊。
+   上一版这里全绿，而 upload-artifact@v5 当时仍然跑 Node 20。两个毛病：
 
-   写成**集合相等**而不是分开断言“各自是 v5”：后者每次 bump 都要改两处常量，
-   而改漏一处的后果恰好是静默的。另加一条自证：抽取器不能返回空集合,
-   空集合相等于空集合会免费通过。 */
+   1. 手写的 SHARED_ACTIONS 只列了两个,upload-artifact 不在里面，因为它只在
+      verify.yml 里出现。**手写清单又一次追不上目录。**
+   2. 那条黑名单扫的是字面的 @v4,升到 v5 就绿了。**而我真正在乎的是运行时。**
 
-const actionVersions = {};
-for (const action of SHARED_ACTIONS) {
-  const inVerify = actionMajors(workflowSrc, action);
-  const inPages = actionMajors(pagesWorkflow, action);
-  actionVersions[action] = { verify: inVerify, pages: inPages };
-  expect(inVerify.length > 0, 'action-extractor-found-' + action, '抽取器在 verify.yml 里一个 ' + action + ' 都没找到，那下面那条等号是空的');
-  expectEq(inVerify, inPages, 'action-major-matches-' + action, action + ' 的大版本在两份 workflow 里不一致，两条流水线跑在不同 Node 上而两边都绿');
-  expectEq(inVerify, '5', 'action-major-is-v5-' + action, action + ' 还在 v4（Node 20 已 deprecated，今天只是 warning）');
+   现在是枚举即期望：两份 YAML 里出现的每一个 actions/* 都必须在登记表里
+   （新加的默认不通过，白名单优于黑名单），且大版本不低于各自下限。
+
+   **但这仍然只是个代理量。** 真值（runs.using）在远程仓库里，从本仓内部读不到，
+   已写进 AGENTS.md 的「测不出来的」。 */
+
+const actionsInVerify = usedActions(workflowSrc);
+const actionsInPages = usedActions(pagesWorkflow);
+const allActions = new Map();
+for (const [name, majors] of actionsInVerify) allActions.set(name, new Set(majors));
+for (const [name, majors] of actionsInPages) {
+  if (!allActions.has(name)) allActions.set(name, new Set());
+  for (const m of majors) allActions.get(name).add(m);
 }
-metrics.actionVersions = actionVersions;
 
-expect(!/actions\/(checkout|setup-node|upload-artifact)@v4/.test(workflowSrc + pagesWorkflow), 'no-node20-actions-left', '还有 action 钉在 v4 上，它跑 Node 20');
+metrics.actionsUsed = Object.fromEntries(Array.from(allActions, ([k, v]) => [k, Array.from(v).sort((a, b) => a - b)]));
+metrics.actionFloors = ACTION_FLOORS;
+
+/* 抽取器自证：两个方向。数量不够 = 它漏了；空 YAML 抽出东西 = 它在胡扯。 */
+expect(allActions.size >= ACTION_MIN_FOUND, 'action-extractor-found-enough', '抽取器只找到 ' + allActions.size + ' 个官方 action，少于 ' + ACTION_MIN_FOUND + '，下面每条循环断言都可能是空的');
+expectEq(usedActions('name: x\njobs:\n  a:\n    steps:\n      - run: echo hi\n').size, 0, 'action-extractor-selftest-negative', '一份没有 action 的 YAML 里居然抽出了东西，抽取器在胡扯');
+expectEq(usedActions('      - uses: actions/checkout@v5\n      # - uses: actions/checkout@v1\n').get('actions/checkout').size, 1, 'action-extractor-skips-comments', '抽取器把注释掉的行也算进去了');
+
+for (const [name, majors] of allActions) {
+  const floor = ACTION_FLOORS[name];
+  expect(floor !== undefined, 'action-registered-' + name, name + ' 不在下限登记表里。新加的 action 默认不通过,先去读一遍 runner 注解确认它跑哪个 Node，再登记');
+  if (floor === undefined) continue;
+  const lowest = Math.min(...majors);
+  expect(lowest >= floor, 'action-meets-floor-' + name, name + ' 用的是 v' + lowest + '，低于下限 v' + floor);
+}
+
+/* 两份都用到的，大版本集合必须逐字相等：只升一边会让两条流水线跑在
+   不同 Node 大版本上，而两边都绿。 */
+let sharedChecked = 0;
+for (const [name, majors] of actionsInVerify) {
+  if (!actionsInPages.has(name)) continue;
+  sharedChecked += 1;
+  const a = Array.from(majors).sort().join(',');
+  const b = Array.from(actionsInPages.get(name)).sort().join(',');
+  expectEq(a, b, 'action-major-matches-' + name, name + ' 的大版本在两份 workflow 里不一致');
+}
+metrics.actionsSharedByBoth = sharedChecked;
+expect(sharedChecked >= 2, 'action-shared-set-non-empty', '两份 workflow 居然没有共用的 action，上面那批等号全是空的');
 
 expect(/report\.yml@main/.test(workflowSrc), 'shared-report-main', '回写 workflow 必须跟随上游 @main');
 expect(!/report\.yml@[0-9a-f]{40}/.test(workflowSrc), 'shared-report-not-sha', '这里不许再钉 SHA');
@@ -308,7 +343,7 @@ expect(/set -o pipefail/.test(workflowSrc) && /\| tee /.test(workflowSrc), 'pipe
 expect(/schedule:\s*[\s\S]*17 3 \* \* \*/.test(workflowSrc), 'schedule-minute-not-zero', 'cron 故意不取整点，有断言守它');
 expect(/uses:\s+supercubegame\/ci-workflows\/.github\/workflows\/report\.yml@main/.test(workflowSrc), 'uses-shared-report', '回写必须走共享 workflow');
 expect(/marker:\s+'<!-- verify-gate -->'/.test(workflowSrc), 'marker-stable', 'marker 变了就找不到同一条评论');
-expect(/actions\/deploy-pages@v4/.test(pagesWorkflow), 'pages-deploy-exists', '在线试玩的 Pages workflow 还没接上');
+expect(allActions.has('actions/deploy-pages'), 'pages-deploy-exists', '在线试玩的 Pages workflow 还没接上');
 expect(/branches: \[main\]/.test(pagesWorkflow), 'pages-only-on-main', 'Pages 只能挂 main：github-pages 环境默认只允许默认分支部署');
 
 const rulesLines = rules.trimEnd().split('\n').length;
