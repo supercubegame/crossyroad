@@ -16,6 +16,9 @@ const MUTANT_EXPECTATIONS = 3;
 const PNG_FILTERS = [0, 1, 2, 3, 4];
 const CRC32_IEND = 0xae426082;
 const PAGES_NEGATIVE_MIN = 4;
+/* 两份 workflow 里都会出现的官方 action。它们的大版本必须逐个相等,
+   只升一边是这类 bump 最容易的失败方式，而它全绿。 */
+const SHARED_ACTIONS = ['actions/checkout', 'actions/setup-node'];
 const fail = [];
 const pass = [];
 const metrics = {};
@@ -37,6 +40,20 @@ function median(arr) {
 }
 function throwsWith(fn) {
   try { fn(); return null; } catch (err) { return String(err && err.message || err); }
+}
+
+/* 从一份 YAML 里抽出某个 action 用到的大版本集合。返回排序后的字串，方便做等号。 */
+function actionMajors(yaml, action) {
+  const found = new Set();
+  const lines = yaml.split('\n');
+  for (const line of lines) {
+    const idx = line.indexOf(action + '@v');
+    if (idx < 0) continue;
+    const rest = line.slice(idx + action.length + 2);
+    const m = rest.match(/^(\d+)/);
+    if (m) found.add(m[1]);
+  }
+  return Array.from(found).sort().join(',');
 }
 
 function stripComments(js) {
@@ -224,15 +241,12 @@ metrics.pagesPositiveBytes = pagesOk.bytes;
 expect(pagesOk.ok, 'pages-guard-accepts-real-index', '守卫把仓里真实的 index.html 判成不合格，锥子和页面已经对不上了（缺 ' + pagesOk.missing.join(',') + '）');
 expect(ANCHORS.length >= 2, 'pages-guard-has-two-anchors', '只留一个锥子的话，404 页恰巧含有那个字串就能免费通过');
 
-/* 负向一：一个真实形状的 404 页。它必须被判红，而且两个锥子都缺。 */
 const sample404 = '<!doctype html><html><head><title>404</title></head><body><h1>404</h1><p>File not found</p><p>The site configured at this address does not contain the requested file.</p></body></html>';
 const res404 = checkPageHtml(sample404);
 pagesNegatives += 1;
 expect(!res404.ok, 'pages-guard-rejects-404', '404 页居然被判成部署成功');
 expectEq(res404.missing.length, ANCHORS.length, 'pages-guard-404-misses-all-anchors', '404 页应该两个锥子都缺');
 
-/* 负向二（承重的那条）：只有一个锥子的页。它证明单一 grep 会被放过，
-   而这正是当初担心的那种假绿。两个方向各做一次，避开「恰好只守住了第一个」。 */
 for (const anchor of ANCHORS) {
   const partial = '<!doctype html><html><body>' + anchor.needle + '</body></html>';
   const res = checkPageHtml(partial);
@@ -253,19 +267,40 @@ expect(!/grep -q/.test(pagesWorkflow), 'pages-workflow-no-inline-grep', '行内 
 
 /* ---------- 心跳提交信息：它已经说过一次谎 ----------
 
-   手动跑的那次，提交信息也写着「定时闸门跑过了」。散文腔化，而且没有任何断言
-   在看它,扫描器只查承诺词和有真值可比的计数。而 git log 恰好是这个仓里最没人
-   复核的那份散文。
+   手动跑的那次，提交信息也写着「定时闸门跑过了」。而 git log 恰好是这个仓里
+   最没人复核的那份散文。
 
    四条里**负向那条是承重的**：光断言「用了变量」是空的,一行字面量加一行变量
-   并存同样通过。所以要数提交命令有几条，并且断言它们里一个字面量都没有。 */
+   并存同样通过。 */
 
 const commitCmdLines = workflowSrc.split('\n').filter(l => l.includes('git commit -m'));
 metrics.heartbeatCommitCommands = commitCmdLines.length;
 expectEq(commitCmdLines.length, 1, 'heartbeat-one-commit-command', '心跳只该有一条提交命令，多出来的那条会绕过下面几条断言');
 expect(/git commit -m "\$msg"/.test(workflowSrc), 'heartbeat-message-from-variable', '提交信息必须来自变量，不能是写死的一句话');
-expect(!commitCmdLines.some(l => /\u5fc3跳/.test(l)), 'heartbeat-message-not-literal', '提交命令里又出现字面量了：手动跑的时候它会写「定时闸门跑过了」，那是假话');
+expect(!commitCmdLines.some(l => /[\u4e00-\u9fff]/.test(l)), 'heartbeat-message-not-literal', '提交命令那行里出现中文了，那就是写死的措辞：手动跑时它会谢「定时闸门跑过了」');
 expect(/if \[ "\$EVENT" = 'schedule' \]/.test(workflowSrc), 'heartbeat-message-branches-on-event', '措辞必须按 $EVENT 分叉，否则两种触发写出同一句话');
+
+/* ---------- 两份 workflow 的 action 大版本要钉在一起 ----------
+
+   只升一边是这类 bump 最容易的失败方式，而它全绿：两条流水线跑在不同 Node
+   大版本上，行为已经分叉而没任何东西在喊。
+
+   写成**集合相等**而不是分开断言“各自是 v5”：后者每次 bump 都要改两处常量，
+   而改漏一处的后果恰好是静默的。另加一条自证：抽取器不能返回空集合,
+   空集合相等于空集合会免费通过。 */
+
+const actionVersions = {};
+for (const action of SHARED_ACTIONS) {
+  const inVerify = actionMajors(workflowSrc, action);
+  const inPages = actionMajors(pagesWorkflow, action);
+  actionVersions[action] = { verify: inVerify, pages: inPages };
+  expect(inVerify.length > 0, 'action-extractor-found-' + action, '抽取器在 verify.yml 里一个 ' + action + ' 都没找到，那下面那条等号是空的');
+  expectEq(inVerify, inPages, 'action-major-matches-' + action, action + ' 的大版本在两份 workflow 里不一致，两条流水线跑在不同 Node 上而两边都绿');
+  expectEq(inVerify, '5', 'action-major-is-v5-' + action, action + ' 还在 v4（Node 20 已 deprecated，今天只是 warning）');
+}
+metrics.actionVersions = actionVersions;
+
+expect(!/actions\/(checkout|setup-node|upload-artifact)@v4/.test(workflowSrc + pagesWorkflow), 'no-node20-actions-left', '还有 action 钉在 v4 上，它跑 Node 20');
 
 expect(/report\.yml@main/.test(workflowSrc), 'shared-report-main', '回写 workflow 必须跟随上游 @main');
 expect(!/report\.yml@[0-9a-f]{40}/.test(workflowSrc), 'shared-report-not-sha', '这里不许再钉 SHA');
