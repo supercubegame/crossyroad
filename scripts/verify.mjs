@@ -251,6 +251,22 @@ expect(Number.isFinite(pagesNegatives) && pagesNegatives >= PAGES_NEGATIVE_MIN, 
 expect(/node scripts\/pages-check\.mjs/.test(pagesWorkflow), 'pages-workflow-calls-script', 'Pages workflow 没调那个脚本，上面那几个样本验的就不是真跑的那段');
 expect(!/grep -q/.test(pagesWorkflow), 'pages-workflow-no-inline-grep', '行内 grep 回来了：那段离线触发不了，也就永远不会被观察到红');
 
+/* ---------- 心跳提交信息：它已经说过一次谎 ----------
+
+   手动跑的那次，提交信息也写着「定时闸门跑过了」。散文腔化，而且没有任何断言
+   在看它,扫描器只查承诺词和有真值可比的计数。而 git log 恰好是这个仓里最没人
+   复核的那份散文。
+
+   四条里**负向那条是承重的**：光断言「用了变量」是空的,一行字面量加一行变量
+   并存同样通过。所以要数提交命令有几条，并且断言它们里一个字面量都没有。 */
+
+const commitCmdLines = workflowSrc.split('\n').filter(l => l.includes('git commit -m'));
+metrics.heartbeatCommitCommands = commitCmdLines.length;
+expectEq(commitCmdLines.length, 1, 'heartbeat-one-commit-command', '心跳只该有一条提交命令，多出来的那条会绕过下面几条断言');
+expect(/git commit -m "\$msg"/.test(workflowSrc), 'heartbeat-message-from-variable', '提交信息必须来自变量，不能是写死的一句话');
+expect(!commitCmdLines.some(l => /\u5fc3跳/.test(l)), 'heartbeat-message-not-literal', '提交命令里又出现字面量了：手动跑的时候它会写「定时闸门跑过了」，那是假话');
+expect(/if \[ "\$EVENT" = 'schedule' \]/.test(workflowSrc), 'heartbeat-message-branches-on-event', '措辞必须按 $EVENT 分叉，否则两种触发写出同一句话');
+
 expect(/report\.yml@main/.test(workflowSrc), 'shared-report-main', '回写 workflow 必须跟随上游 @main');
 expect(!/report\.yml@[0-9a-f]{40}/.test(workflowSrc), 'shared-report-not-sha', '这里不许再钉 SHA');
 expect(/set -o pipefail/.test(workflowSrc) && /\| tee /.test(workflowSrc), 'pipefail-with-tee', '| tee 会吃退出码，必须同段出现 pipefail');
@@ -280,7 +296,7 @@ metrics.nextDueInDays = Number.isFinite(nextDue) ? nextDue : null;
 const now = Date.now();
 const last = hb.last_scheduled_run ? Date.parse(hb.last_scheduled_run) : null;
 const ageDays = last ? Math.floor((now - last) / 86400000) : null;
-metrics.heartbeat = { state: last ? 'seen' : 'pending-first-schedule', ageDays: ageDays, maxAgeDays: MAX_HEARTBEAT_AGE_DAYS, crons: ['17 3 * * *'], lastScheduledRun: hb.last_scheduled_run, lastManualRun: hb.last_manual_run };
+metrics.heartbeat = { state: last ? 'seen' : 'pending-first-schedule', ageDays: ageDays, maxAgeDays: MAX_HEARTBEAT_AGE_DAYS, crons: ['17 3 * * *'], lastScheduledRun: hb.last_scheduled_run, lastManualRun: hb.last_manual_run, runs: hb.runs };
 if (last) expect(ageDays <= MAX_HEARTBEAT_AGE_DAYS, 'heartbeat-fresh-enough', '定时心跳太旧，像是 cron 已经死了');
 else ok('heartbeat-pending-first-schedule');
 
