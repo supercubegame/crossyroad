@@ -1,10 +1,10 @@
 {
   "_": "定时闸门跑过的正向痕迹。平台会因为仓库长期不活跃**静默停用定时工作流**，而那时 workflow 文件一个字都不会变 - 「读配置确认 cron 还在」这条检查会在它本该抓住的那次失效上保持绿色。「没有坏消息」和「已经死了」长得一样，带时间戳的正向痕迹不会。",
   "_grace": "last_scheduled_run 还是 null 的时候，宽限期的起点不读这个文件里的任何字段，而是读 git 里 heartbeat.json 的落地时间 - 换一个不会跟着我一起改的证人。",
-  "last_scheduled_run": "2026-08-25T04:04:16.703Z",
+  "last_scheduled_run": "2026-08-26T04:06:50.244Z",
   "last_manual_run": "2026-08-17T04:35:59.716Z",
   "last_event": "schedule",
   "gate_result": "success",
   "web_result": "success",
-  "runs": 11
+  "runs": 12
 }
